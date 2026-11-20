@@ -1,0 +1,148 @@
+From: Stephender (Antigravity Phase 1 Fix 1b)
+Subject: [PATCH] Add physical RAM helper and use it for default undo memory cap
+
+Follow-up to 0001-undo-hardening.patch. Applies on top of
+0001-undo-hardening.patch against Blender v5.2.4 (cd5dc428cce1).
+
+The bug:
+BLI_system_memory_max_in_megabytes() does NOT return installed physical RAM:
+- source/blender/blenlib/BLI_system.h:38-41 documents it as "Get maximum
+  addressable memory in megabytes" / "(clamped to #INT_MAX)".
+- source/blender/blenlib/intern/system.cc:208-216 computes
+  `(size_t(1) << (sizeof(size_t[8]) - 1)) >> 20 * 2` (~16 EiB on 64-bit),
+  which is maximum virtual address space, not installed RAM.
+- BLI_system_memory_max_in_megabytes_int() (system.cc:218-223) clamps that
+  to INT_MAX (2,147,483,647 MB).
+
+Because Fix 1 called BLI_system_memory_max_in_megabytes_int() / 16 in
+BKE_blendfile_userdef_from_defaults(), clamp(ram_mb / 16, 256, 2048) was a
+constant 2048 MB on every 64-bit machine (verified live: Fix 1 printed
+undo_mem_limit 2048 on both the 7.7 GB Linux VM and the 16 GB Windows CI
+runner).
+
+What changed:
+- source/blender/blenlib/BLI_system.h: declare
+  BLI_system_memory_physical_in_megabytes() returning physical installed RAM
+  in megabytes, explicitly contrasted with BLI_system_memory_max_in_megabytes.
+- source/blender/blenlib/intern/system.cc: define
+  BLI_system_memory_physical_in_megabytes() following Cycles'
+  system_physical_ram() pattern (intern/cycles/util/system.cpp:247-266):
+  GlobalMemoryStatusEx on Windows (via existing BLI_winstuff.h -> windows.h),
+  sysctlbyname("hw.memsize") on macOS (adding <sys/sysctl.h> and <sys/types.h>
+  under #if defined(__APPLE__)), and sysconf(_SC_PAGESIZE) *
+  sysconf(_SC_PHYS_PAGES) on Linux/POSIX (via existing <unistd.h>), plus
+  <cstdint> for uint64_t.
+- source/blender/blenkernel/intern/blendfile.cc: switch Fix 1's
+  userdef->undomemory initialization in BKE_blendfile_userdef_from_defaults()
+  to BLI_system_memory_physical_in_megabytes(), keeping clamp(ram_mb / 16,
+  256, 2048). Upstream's userdef->memcachelimit line is untouched.
+
+Expected observable difference (factory default undo_mem_limit):
+- 16 GB CI runner (16,384 MiB): 1024 MB (was 2048 MB; ~1000-1024 MB if
+  firmware reserves a fraction of RAM).
+- 8 GB laptop (8,192 MiB): 512 MB (was 2048 MB).
+- 4 GB laptop (4,096 MiB): 256 MB (was 2048 MB).
+- >=32 GB machine: 2048 MB (clamp max, unchanged).
+
+Note: staged Fix 2 (phase1-fix2-ram-aware-cache.patch) still calls
+BLI_system_memory_max_in_megabytes_int() and should be updated to use
+BLI_system_memory_physical_in_megabytes() in a separate job.
+
+STATUS: STAGED - verified to apply cleanly on top of 0001-undo-hardening.patch
+against Blender v5.2.4 (cd5dc428cce1). NOT yet in stephender-repo/patches/.
+
+diff --git a/source/blender/blenkernel/intern/blendfile.cc b/source/blender/blenkernel/intern/blendfile.cc
+index 8c9af7e..85676fc 100644
+--- a/source/blender/blenkernel/intern/blendfile.cc
++++ b/source/blender/blenkernel/intern/blendfile.cc
+@@ -1569,11 +1569,12 @@ UserDef *BKE_blendfile_userdef_from_defaults()
+   userdef->memcachelimit = min_ii(BLI_system_memory_max_in_megabytes_int() / 2,
+                                   userdef->memcachelimit);
+ 
+-  /* Cap default undo stack proportionally to RAM (256 MB on <=4 GB, 512 MB on
+-   * 8 GB, up to 2048 MB). The DNA default stays 0 (unlimited) so saved
+-   * userpref.blend files that explicitly chose 0 are still respected. */
+-  userdef->undomemory = min_ii(max_ii(BLI_system_memory_max_in_megabytes_int() / 16, 256),
+-                               2048);
++  /* Cap default undo stack proportionally to physical RAM (256 MB on <=4 GB,
++   * 512 MB on 8 GB, 1024 MB on 16 GB, up to 2048 MB). The DNA default stays 0
++   * (unlimited) so saved userpref.blend files that explicitly chose 0 are still
++   * respected. */
++  userdef->undomemory = int(
++      min_zz(max_zz(BLI_system_memory_physical_in_megabytes() / 16, size_t(256)), size_t(2048)));
+ 
+   /* Init weight paint range. */
+   BKE_colorband_init(&userdef->coba_weight, true);
+diff --git a/source/blender/blenlib/BLI_system.h b/source/blender/blenlib/BLI_system.h
+index bf7d7e0..b6ec41a 100644
+--- a/source/blender/blenlib/BLI_system.h
++++ b/source/blender/blenlib/BLI_system.h
+@@ -39,6 +39,12 @@ void BLI_hostname_get(char *buffer, size_t buffer_maxncpy);
+ size_t BLI_system_memory_max_in_megabytes();
+ /** Get maximum addressable memory in megabytes (clamped to #INT_MAX). */
+ int BLI_system_memory_max_in_megabytes_int();
++/**
++ * Get physical installed RAM in megabytes (returns 0 if unavailable).
++ * Unlike #BLI_system_memory_max_in_megabytes (which returns maximum addressable
++ * virtual memory), this queries actual physical system RAM.
++ */
++size_t BLI_system_memory_physical_in_megabytes();
+ 
+ /**
+  * Ensure the process can open many files simultaneously.
+diff --git a/source/blender/blenlib/intern/system.cc b/source/blender/blenlib/intern/system.cc
+index 473457d..e36bf0f 100644
+--- a/source/blender/blenlib/intern/system.cc
++++ b/source/blender/blenlib/intern/system.cc
+@@ -8,6 +8,7 @@
+ 
+ #include <algorithm>
+ #include <climits>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -28,6 +29,10 @@
+ #  if defined(HAVE_EXECINFO_H)
+ #    include <execinfo.h>
+ #  endif
++#  if defined(__APPLE__)
++#    include <sys/sysctl.h>
++#    include <sys/types.h>
++#  endif
+ #  include <sys/resource.h>
+ #  include <unistd.h>
+ #endif
+@@ -222,6 +227,32 @@ int BLI_system_memory_max_in_megabytes_int()
+   return int(min_zz(limit_megabytes, size_t(INT_MAX)));
+ }
+ 
++size_t BLI_system_memory_physical_in_megabytes()
++{
++#if defined(WIN32)
++  MEMORYSTATUSEX ram = {};
++  ram.dwLength = sizeof(ram);
++  if (GlobalMemoryStatusEx(&ram)) {
++    return size_t(ram.ullTotalPhys >> 20);
++  }
++  return 0;
++#elif defined(__APPLE__)
++  uint64_t ram = 0;
++  size_t len = sizeof(ram);
++  if (sysctlbyname("hw.memsize", &ram, &len, nullptr, 0) == 0) {
++    return size_t(ram >> 20);
++  }
++  return 0;
++#else
++  const long page_size = sysconf(_SC_PAGESIZE);
++  const long phys_pages = sysconf(_SC_PHYS_PAGES);
++  if (page_size > 0 && phys_pages > 0) {
++    return size_t((uint64_t(page_size) * uint64_t(phys_pages)) >> 20);
++  }
++  return 0;
++#endif
++}
++
+ void BLI_system_max_open_files_ensure()
+ {
+   /* The Windows maximum is documented as 8192. */
