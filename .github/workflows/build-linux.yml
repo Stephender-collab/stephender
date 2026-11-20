@@ -69,18 +69,18 @@ jobs:
         run: |
           export CC=/usr/bin/gcc-14
           export CXX=/usr/bin/g++-14
-          make -j4 BUILD_CMAKE_ARGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          make ninja NPROCS=4 BUILD_CMAKE_ARGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
 
       - name: Smoke test the build
         working-directory: blender-source
         run: |
-          ./build_linux/bin/blender --version
-          ./build_linux/bin/blender --background --factory-startup --python-expr "import bpy; print('objects:', len(bpy.data.objects)); print('undo_mem_limit:', bpy.context.preferences.edit.undo_memory_limit)"
+          ../build_linux/bin/blender --version
+          ../build_linux/bin/blender --background --factory-startup --python-expr "import bpy; print('objects:', len(bpy.data.objects)); print('undo_mem_limit:', bpy.context.preferences.edit.undo_memory_limit)"
 
       - name: Package
         working-directory: blender-source
         run: |
-          tar -cJf stephender-linux-x64.tar.xz -C build_linux/bin blender 5.2
+          tar -cJf stephender-linux-x64.tar.xz -C ../build_linux/bin blender 5.2
           sha256sum stephender-linux-x64.tar.xz | tee stephender-linux-x64.tar.xz.sha256
           ls -lh stephender-linux-x64.tar.xz
 
