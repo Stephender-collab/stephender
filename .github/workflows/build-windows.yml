@@ -39,7 +39,9 @@ jobs:
         run: |
           choco install svn -y
           choco install sccache -y
-          refreshenv
+          if (-not (Get-Command svn -ErrorAction SilentlyContinue) -and (Test-Path "C:\Program Files (x86)\Subversion\bin")) {
+            Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files (x86)\Subversion\bin" -Encoding ascii
+          }
         shell: powershell
 
       - name: Restore sccache
@@ -75,7 +77,6 @@ jobs:
         working-directory: blender-source
         shell: cmd
         run: |
-          set PATH=C:\ProgramData\sccache;%PATH%
           make -j4 BUILD_CMAKE_ARGS="-DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
 
       - name: Smoke test the build
