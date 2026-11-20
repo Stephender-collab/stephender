@@ -75,7 +75,7 @@ jobs:
         working-directory: blender-source
         shell: powershell
         run: |
-          $patches = Get-ChildItem ..\patches\*.patch -ErrorAction SilentlyContinue
+          $patches = Get-ChildItem ..\patches\*.patch -ErrorAction SilentlyContinue | Sort-Object Name
           foreach ($p in $patches) {
             Write-Host "Applying $($p.Name)"
             git apply --check $p.FullName; if ($LASTEXITCODE -ne 0) { exit 1 }

@@ -1,0 +1,143 @@
+From: Stephender (Antigravity lead-planner proposal, Phase 1 Fix 1)
+Subject: [PATCH] Harden undo memory cap + fix memfile merge accounting + RAM-aware default
+
+Fix 1 (1A-1D) from ANTIGRAVITY-PLAN.md. Replaces the one-line
+phase2-proposal1-undomemory-256.patch (superseded: not a hard cap, can
+leave zero usable undo steps).
+
+1A undofile.cc: BLO_memfile_merge now adds transferred chunk bytes to
+   second->size (MemFile.size counts owned bytes only; ownership transfer
+   without accounting made the cap undercount).
+1B memfile_undo.cc: after a merge, re-sync us_next->data->undo_size and
+   us_next->step.data_size from the (now correct) memfile.size.
+1C undo_system.cc: limiter rewritten so it always keeps >=2 usable undo
+   steps (active state + 1 previous state); a single huge step may exceed
+   the cap, but Ctrl+Z never breaks. Step-count limiting preserved.
+1D blendfile.cc: factory default undomemory is RAM-aware:
+   clamp(ram_mb / 16, 256, 2048). DNA default stays 0 so saved
+   userpref.blend files that explicitly chose 0 are still respected.
+
+STATUS: STAGED - drafted and verified to apply cleanly against Blender
+v5.2.4 (cd5dc428cce1). NOT yet in stephender-repo/patches/ (Phase 0
+zero-patch baseline build runs first). Still needs: CI build, CTest,
+bl_global_undo.py, sculpt_undo_test, tests/performance/tests/undo.py,
+and the runtime undo test at 256/512 MB limits.
+
+diff --git a/source/blender/blenkernel/intern/blendfile.cc b/source/blender/blenkernel/intern/blendfile.cc
+index d2eb290..8c9af7e 100644
+--- a/source/blender/blenkernel/intern/blendfile.cc
++++ b/source/blender/blenkernel/intern/blendfile.cc
+@@ -1569,6 +1569,12 @@ UserDef *BKE_blendfile_userdef_from_defaults()
+   userdef->memcachelimit = min_ii(BLI_system_memory_max_in_megabytes_int() / 2,
+                                   userdef->memcachelimit);
+ 
++  /* Cap default undo stack proportionally to RAM (256 MB on <=4 GB, 512 MB on
++   * 8 GB, up to 2048 MB). The DNA default stays 0 (unlimited) so saved
++   * userpref.blend files that explicitly chose 0 are still respected. */
++  userdef->undomemory = min_ii(max_ii(BLI_system_memory_max_in_megabytes_int() / 16, 256),
++                               2048);
++
+   /* Init weight paint range. */
+   BKE_colorband_init(&userdef->coba_weight, true);
+ 
+diff --git a/source/blender/blenkernel/intern/undo_system.cc b/source/blender/blenkernel/intern/undo_system.cc
+index a94c13b..235db21 100644
+--- a/source/blender/blenkernel/intern/undo_system.cc
++++ b/source/blender/blenkernel/intern/undo_system.cc
+@@ -424,7 +424,8 @@ void BKE_undosys_stack_limit_steps_and_memory(UndoStack *ustack, int steps, size
+   CLOG_DEBUG(&LOG, "Limit steps=%d, memory_limit=%zu", steps, memory_limit);
+   UndoStep *us;
+   UndoStep *us_exclude = nullptr;
+-  /* keep at least two (original + other) */
++  UndoStep *us_trim_last = nullptr; /* Last (newest) step to delete, inclusive. */
++  /* Keep at least two usable steps (active state + 1 previous state to undo to). */
+   size_t data_size_all = 0;
+   size_t us_count = 0;
+   for (us = static_cast<UndoStep *>(ustack->steps.last); us && us->prev; us = us->prev) {
+@@ -436,26 +437,43 @@ void BKE_undosys_stack_limit_steps_and_memory(UndoStack *ustack, int steps, size
+                    us_count,
+                    data_size_all,
+                    memory_limit);
+-        break;
++        if (us_count >= 2) {
++          /* Already have >=2 usable steps newer than `us`; drop `us` and older. */
++          us_trim_last = us;
++          break;
++        }
++        if (us_count == 1 && !us->skip) {
++          /* Need `us` as the 2nd usable step; drop everything older than `us`. */
++          us_trim_last = us->prev;
++          break;
++        }
+       }
+     }
+     if (steps != -1) {
+-      if (us_count == steps) {
++      if (us_count == size_t(steps)) {
++        us_trim_last = us->prev;
+         break;
+       }
+-      if (us->skip == false) {
+-        us_count += 1;
+-      }
++    }
++    if (us->skip == false) {
++      us_count += 1;
+     }
+   }
+ 
+   CLOG_DEBUG(&LOG, "Total steps %zu: data_size_all=%zu", us_count, data_size_all);
+ 
+-  if (us) {
++  if (us_trim_last) {
+ #ifdef WITH_GLOBAL_UNDO_KEEP_ONE
+     /* Hack, we need to keep at least one BKE_UNDOSYS_TYPE_MEMFILE. */
+-    if (us->type != BKE_UNDOSYS_TYPE_MEMFILE) {
+-      us_exclude = us->prev;
++    bool has_surviving_memfile = false;
++    for (UndoStep *us_keep = us_trim_last->next; us_keep; us_keep = us_keep->next) {
++      if (us_keep->type == BKE_UNDOSYS_TYPE_MEMFILE) {
++        has_surviving_memfile = true;
++        break;
++      }
++    }
++    if (!has_surviving_memfile) {
++      us_exclude = us_trim_last;
+       while (us_exclude && us_exclude->type != BKE_UNDOSYS_TYPE_MEMFILE) {
+         us_exclude = us_exclude->prev;
+       }
+@@ -469,7 +487,7 @@ void BKE_undosys_stack_limit_steps_and_memory(UndoStack *ustack, int steps, size
+ #endif
+     /* Free from first to last, free functions may update de-duplication info
+      * (see #MemFileUndoStep). */
+-    undosys_stack_clear_all_first(ustack, us->prev, us_exclude);
++    undosys_stack_clear_all_first(ustack, us_trim_last, us_exclude);
+   }
+ }
+ 
+diff --git a/source/blender/blenloader/intern/undofile.cc b/source/blender/blenloader/intern/undofile.cc
+index d72e59e..9a90780 100644
+--- a/source/blender/blenloader/intern/undofile.cc
++++ b/source/blender/blenloader/intern/undofile.cc
+@@ -80,6 +80,7 @@ void BLO_memfile_merge(MemFile *first, MemFile *second)
+       if (MemFileChunk *sc = buffer_to_second_memchunk.lookup_default(fc.buf, nullptr)) {
+         BLI_assert(sc->is_identical);
+         sc->is_identical = false;
++        second->size += sc->size; /* Ownership moved to `second`; account for it. */
+         fc.is_identical = true;
+       }
+       /* Note that if the second memfile does not use that chunk, we assume that the first one
+diff --git a/source/blender/editors/undo/memfile_undo.cc b/source/blender/editors/undo/memfile_undo.cc
+index 968d158..e773642 100644
+--- a/source/blender/editors/undo/memfile_undo.cc
++++ b/source/blender/editors/undo/memfile_undo.cc
+@@ -330,6 +330,9 @@ static void memfile_undosys_step_free(UndoStep *us_p)
+     if (us_next_p != nullptr) {
+       MemFileUndoStep *us_next = reinterpret_cast<MemFileUndoStep *>(us_next_p);
+       BLO_memfile_merge(&us->data->memfile, &us_next->data->memfile);
++      /* The merge moved owned bytes into `us_next`; re-sync its accounted size. */
++      us_next->data->undo_size = us_next->data->memfile.size;
++      us_next->step.data_size = us_next->data->undo_size;
+     }
+   }
+ 

@@ -57,11 +57,16 @@ jobs:
         working-directory: blender-source
         run: |
           shopt -s nullglob
-          for p in ../patches/*.patch; do
-            echo "Applying $p"
-            git apply --check "$p" && git apply "$p"
-          done
-          echo "No patches to apply (zero-patch baseline) if the loop was empty."
+          patches=(../patches/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "No patches to apply (zero-patch baseline)."
+          else
+            for p in "${patches[@]}"; do
+              echo "Applying $p"
+              git apply --check "$p"
+              git apply "$p"
+            done
+          fi
           git status --short
 
       - name: Configure and build (Release, ccache, Ninja)
