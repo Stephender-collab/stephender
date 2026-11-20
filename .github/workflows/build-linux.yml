@@ -1,0 +1,102 @@
+# Stephender — Linux build (DRAFT, to be validated by the Phase 0 zero-patch baseline run)
+# Builds Blender 5.2.4 LTS from source + applies patches/*.patch, one at a time.
+# Free GitHub Actions runner: ubuntu-24.04, 4 vCPU, 16 GB RAM.
+# Delivery: GitHub Releases (no tunnels, no browser downloads).
+name: Build Stephender (Linux)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-24.04
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+    steps:
+      - name: Check out stephender repo
+        uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache ninja-build subversion
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-linux-${{ hashFiles('patches/*.patch') }}
+          restore-keys: |
+            ccache-linux-
+
+      - name: Clone Blender v5.2.4 (shallow)
+        run: git clone --depth 1 --branch v5.2.4 https://projects.blender.org/blender/blender.git blender-source
+
+      - name: Get prebuilt libraries
+        working-directory: blender-source
+        run: |
+          python3 build_files/build_environment/install_linux_packages.py
+          make update
+
+      - name: Apply Stephender patches
+        working-directory: blender-source
+        run: |
+          shopt -s nullglob
+          for p in ../patches/*.patch; do
+            echo "Applying $p"
+            git apply --check "$p" && git apply "$p"
+          done
+          echo "No patches to apply (zero-patch baseline) if the loop was empty."
+          git status --short
+
+      - name: Configure and build (Release, ccache, Ninja)
+        working-directory: blender-source
+        run: |
+          export PATH="/usr/lib/ccache:$PATH"
+          make -j4 BUILD_CMAKE_ARGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+
+      - name: Smoke test the build
+        working-directory: blender-source
+        run: |
+          ./build_linux/bin/blender --version
+          ./build_linux/bin/blender --background --factory-startup --python-expr "import bpy; print('objects:', len(bpy.data.objects)); print('undo_mem_limit:', bpy.context.preferences.edit.undo_memory_limit)"
+
+      - name: Package
+        working-directory: blender-source
+        run: |
+          tar -cJf stephender-linux-x64.tar.xz -C build_linux/bin blender 5.2
+          sha256sum stephender-linux-x64.tar.xz | tee stephender-linux-x64.tar.xz.sha256
+          ls -lh stephender-linux-x64.tar.xz
+
+      - name: Upload build artifact (kept 30 days)
+        uses: actions/upload-artifact@v4
+        with:
+          name: stephender-linux-x64
+          path: |
+            blender-source/stephender-linux-x64.tar.xz
+            blender-source/stephender-linux-x64.tar.xz.sha256
+          retention-days: 30
+
+      # Publishing to a GitHub Release happens on release events only.
+      - name: Publish to GitHub Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            blender-source/stephender-linux-x64.tar.xz
+            blender-source/stephender-linux-x64.tar.xz.sha256

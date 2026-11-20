@@ -1,0 +1,112 @@
+# Stephender — Windows build (DRAFT, to be validated by the Phase 0 zero-patch baseline run)
+# Builds Blender 5.2.4 LTS from source + applies patches/*.patch, one at a time.
+# Free GitHub Actions runner: windows-2022, 4 vCPU, 16 GB RAM, MSVC 2022.
+# This is the build that runs on the ThinkPad T460 — built from Phase 0, not Phase 5.
+# Delivery: GitHub Releases (no tunnels, no browser downloads).
+name: Build Stephender (Windows)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    env:
+      SCCACHE_DIR: ${{ github.workspace }}\.sccache
+    steps:
+      - name: Check out stephender repo
+        uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Subversion + sccache
+        run: |
+          choco install svn -y
+          choco install sccache -y
+          refreshenv
+        shell: powershell
+
+      - name: Restore sccache
+        uses: actions/cache@v4
+        with:
+          path: .sccache
+          key: sccache-windows-${{ hashFiles('patches/*.patch') }}
+          restore-keys: |
+            sccache-windows-
+
+      - name: Clone Blender v5.2.4 (shallow)
+        run: git clone --depth 1 --branch v5.2.4 https://projects.blender.org/blender/blender.git blender-source
+
+      - name: Get prebuilt libraries
+        working-directory: blender-source
+        run: make update
+        shell: cmd
+
+      - name: Apply Stephender patches
+        working-directory: blender-source
+        shell: powershell
+        run: |
+          $patches = Get-ChildItem ..\patches\*.patch -ErrorAction SilentlyContinue
+          foreach ($p in $patches) {
+            Write-Host "Applying $($p.Name)"
+            git apply --check $p.FullName; if ($LASTEXITCODE -ne 0) { exit 1 }
+            git apply $p.FullName; if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+          if (-not $patches) { Write-Host "No patches to apply (zero-patch baseline)." }
+          git status --short
+
+      - name: Configure and build (Release, sccache, Ninja)
+        working-directory: blender-source
+        shell: cmd
+        run: |
+          set PATH=C:\ProgramData\sccache;%PATH%
+          make -j4 BUILD_CMAKE_ARGS="-DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
+
+      - name: Smoke test the build
+        working-directory: blender-source
+        shell: cmd
+        run: |
+          build_windows_Release\bin\blender.exe --version
+          build_windows_Release\bin\blender.exe --background --factory-startup --python-expr "import bpy; print('objects:', len(bpy.data.objects)); print('undo_mem_limit:', bpy.context.preferences.edit.undo_memory_limit)"
+
+      - name: Package
+        working-directory: blender-source
+        shell: powershell
+        run: |
+          Compress-Archive -Path build_windows_Release\bin\blender.exe, build_windows_Release\bin\5.2 -DestinationPath stephender-windows-x64.zip
+          (Get-FileHash stephender-windows-x64.zip -Algorithm SHA256).Hash | Out-File stephender-windows-x64.zip.sha256
+          Get-ChildItem stephender-windows-x64.zip | Select-Object Length
+
+      - name: Upload build artifact (kept 30 days)
+        uses: actions/upload-artifact@v4
+        with:
+          name: stephender-windows-x64
+          path: |
+            blender-source/stephender-windows-x64.zip
+            blender-source/stephender-windows-x64.zip.sha256
+          retention-days: 30
+
+      # Publishing to a GitHub Release happens on release events only.
+      - name: Publish to GitHub Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            blender-source/stephender-windows-x64.zip
+            blender-source/stephender-windows-x64.zip.sha256
