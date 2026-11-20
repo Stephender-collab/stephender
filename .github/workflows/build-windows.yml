@@ -90,7 +90,7 @@ jobs:
         working-directory: blender-source
         shell: powershell
         run: |
-          Compress-Archive -Path ..\build_windows_x64_vc17_Release\bin\blender.exe, ..\build_windows_x64_vc17_Release\bin\5.2 -DestinationPath stephender-windows-x64.zip
+          Compress-Archive -Path ..\build_windows_x64_vc17_Release\bin\* -DestinationPath stephender-windows-x64.zip
           (Get-FileHash stephender-windows-x64.zip -Algorithm SHA256).Hash | Out-File stephender-windows-x64.zip.sha256
           Get-ChildItem stephender-windows-x64.zip | Select-Object Length
 

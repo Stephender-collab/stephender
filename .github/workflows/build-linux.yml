@@ -80,7 +80,7 @@ jobs:
       - name: Package
         working-directory: blender-source
         run: |
-          tar -cJf stephender-linux-x64.tar.xz -C ../build_linux/bin blender 5.2
+          tar -cJf stephender-linux-x64.tar.xz -C ../build_linux/bin blender 5.2 lib
           sha256sum stephender-linux-x64.tar.xz | tee stephender-linux-x64.tar.xz.sha256
           ls -lh stephender-linux-x64.tar.xz
 
