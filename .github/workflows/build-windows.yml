@@ -57,7 +57,7 @@ jobs:
 
       - name: Get prebuilt libraries
         working-directory: blender-source
-        run: make update
+        run: echo y | make update
         shell: cmd
 
       - name: Apply Stephender patches
