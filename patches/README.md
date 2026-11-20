@@ -13,13 +13,15 @@ Currently in:
   commit d04a64a, 2026-11-20)
 - `0002-physical-ram.patch` (Phase 1 Fix 1b, real physical-RAM helper
   `BLI_system_memory_physical_in_megabytes()` + undo default uses it;
-  landed locally 2026-11-20, NOT yet pushed — waiting on the 64c8e4a
-  regression-test builds to finish first)
+  commit c7f8658, pushed 2026-11-20; both builds green — smoke test
+  printed undo_mem_limit 1023 (Windows) and 998 (Linux) on the 16 GB
+  runners, not 2048, proving the helper reads real RAM)
+- `0003-ram-aware-cache.patch` (Phase 1 Fix 2, cache limit + GPU GC
+  scaled from real physical RAM: <=8 GB machines get memcachelimit
+  ram/8 clamped 256–1024 MB and 30s/15s cleanup timeouts; >8 GB
+  machines exactly upstream (ram/2 up to the 4096 MB default))
 
-Still staged in the parent project folder, one per cycle after Fix 1b:
-- `../phase1-fix2-ram-aware-cache.patch` (0003, cache limit + GPU GC —
-  REWORK NEEDED first: must use the new physical-RAM helper, same
-  misleading function would make it a no-op on small laptops)
+Still staged in the parent project folder, one per cycle:
 - `../phase1-fix3-tbb-trim-thp-guard-v2.patch` (0004, allocator trim +
   huge-pages guard — v2 reworked + verified; v1 superseded, it had an
   INC_SYS wipe bug that would break the Linux build)

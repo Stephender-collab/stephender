@@ -1,0 +1,99 @@
+From: Stephender (Antigravity Phase 1 Fix 2, v2 rework)
+Subject: [PATCH] RAM-aware memcachelimit + faster texture/VBO cleanup on low-RAM machines
+
+Fix 2 from ANTIGRAVITY-PLAN.md (v2 rework). Applies on top of
+0001-undo-hardening.patch + 0002-physical-ram.patch against Blender v5.2.4
+(cd5dc428cce1). Touches only source/blender/blenkernel/intern/blendfile.cc.
+
+Defects fixed vs v1 (phase1-fix2-ram-aware-cache.patch):
+1. Wrong RAM function (made v1 a complete no-op on <=8 GB machines):
+   v1 called BLI_system_memory_max_in_megabytes_int(), which returns maximum
+   addressable virtual memory (~16 EiB on 64-bit, clamped to INT_MAX =
+   2,147,483,647 MB), NOT installed physical RAM (BLI_system.h:38-41,
+   system.cc:208-223). Consequently `ram_mb <= 8192` could never be true on
+   any 64-bit machine.
+   v2 switches to BLI_system_memory_physical_in_megabytes() (added by
+   0002-physical-ram.patch, returning `size_t` physical RAM in MB or 0 if
+   unavailable) and performs the comparison and clamping in `size_t` via
+   min_zz()/max_zz() before narrowing to `int` (following 0002's conversion
+   pattern, clean under -Wall -Wextra -Werror).
+2. Wrong upstream comment:
+   v1's comment claimed upstream used quarter-of-RAM (ram / 4) for
+   memcachelimit. Pristine source/blender/blenkernel/intern/blendfile.cc:
+   1569-1570 actually uses ram / 2:
+     userdef->memcachelimit = min_ii(BLI_system_memory_max_in_megabytes_int() / 2,
+                                     userdef->memcachelimit);
+   (which always evaluated to the DNA default 4096 MB on 64-bit because
+   INT_MAX / 2 >> 4096). v2 corrects the comment and cites lines 1569-1570.
+
+What this patch does (same caps and timeouts as v1; >8 GB branch corrected
+to ram/2 during Muse's verification, so it is identical to upstream):
+- In BKE_blendfile_userdef_from_defaults(), reads physical RAM in MB via
+  BLI_system_memory_physical_in_megabytes():
+  - On <=8 GB machines (ram_mb <= 8192): caps userdef->memcachelimit at
+    ram_mb / 8 clamped to [256, 1024] MB (still bounded by the DNA default
+    4096 MB), and sets unused GPU texture/VBO eviction to 30 s timeout /
+    15 s collect rate (DNA defaults: 120 s / 60 s in DNA_userdef_types.h:
+    1101-1102), freeing shared-memory iGPU RAM more promptly.
+  - On >8 GB machines (ram_mb > 8192): leaves textimeout/texcollectrate and
+    vbotimeout/vbocollectrate at DNA defaults (120 s / 60 s), and keeps
+    upstream's min(ram_mb / 2, userdef->memcachelimit) cap (4096 MB on all
+    >8 GB machines — identical to upstream).
+- 100% user-overridable in Preferences; zero features changed.
+
+Expected observable (factory default with DNA memcachelimit = 4096):
+- <=8 GB machines (branch ram_mb <= 8192 triggers):
+  - 8 GB (8192 MB): 8192 / 8 = 1024 -> memcachelimit = 1024 MB;
+    textimeout = 30, texcollectrate = 15, vbotimeout = 30, vbocollectrate = 15.
+  - 7.7 GB VM (7934 MB): 7934 / 8 = 991 -> memcachelimit = 991 MB;
+    timeouts = 30 s / 15 s.
+  - 4 GB (4096 MB): 4096 / 8 = 512 -> memcachelimit = 512 MB;
+    timeouts = 30 s / 15 s.
+  - <=2 GB (<=2048 MB) or unavailable (0 MB): clamped to 256 MB;
+    timeouts = 30 s / 15 s.
+- >8 GB machines (branch ram_mb <= 8192 does NOT trigger):
+  - All >8 GB machines (12 GB, 16 GB, 32 GB, including 16 GB hosts with
+    firmware-reserved RAM): min(ram_mb / 2, 4096) = 4096 MB; timeouts
+    unchanged at 120 s / 60 s — exactly upstream behaviour.
+
+STATUS: STAGED - verified to apply cleanly on top of 0001 + 0002 against
+Blender v5.2.4 (cd5dc428cce1). Edited by Muse during verification: >8 GB
+branch ram/4 -> ram/2 (v1's ram/4 would have cut 12 GB machines to 3072 MB
+and firmware-reserved 16 GB to ~4000 MB; ram/2 keeps every >8 GB machine
+exactly at upstream's 4096 MB); edited stack re-verified to apply cleanly.
+NOT yet in stephender-repo/patches/.
+
+diff --git a/source/blender/blenkernel/intern/blendfile.cc b/source/blender/blenkernel/intern/blendfile.cc
+index 85676fc..aa8309a 100644
+--- a/source/blender/blenkernel/intern/blendfile.cc
++++ b/source/blender/blenkernel/intern/blendfile.cc
+@@ -1566,8 +1566,27 @@ UserDef *BKE_blendfile_userdef_from_defaults()
+     BLI_path_slash_ensure(userdef->fontdir, sizeof(userdef->fontdir));
+   }
+ 
+-  userdef->memcachelimit = min_ii(BLI_system_memory_max_in_megabytes_int() / 2,
+-                                  userdef->memcachelimit);
++  /* Cap the VSE/ImBuf memory cache proportionally to physical RAM. Upstream
++   * blendfile.cc:1569-1570 used `min_ii(BLI_system_memory_max_in_megabytes_int() / 2,
++   * userdef->memcachelimit)` (effectively 4096 MB on 64-bit, since max addressable
++   * memory clamps to INT_MAX). On <=8 GB laptops cap at ram/8 clamped to 256..1024 MB
++   * (was up to 4 GB, straight into swap); on >8 GB machines cap at ram/2 up to the
++   * default 4096 MB (identical to upstream on all >8 GB machines). */
++  const size_t ram_mb = BLI_system_memory_physical_in_megabytes();
++  const size_t default_limit = size_t(max_ii(userdef->memcachelimit, 0));
++  const size_t cache_cap = (ram_mb <= size_t(8192)) ?
++                               min_zz(max_zz(ram_mb / 8, size_t(256)), size_t(1024)) :
++                               min_zz(ram_mb / 2, default_limit);
++  userdef->memcachelimit = int(min_zz(cache_cap, default_limit));
++
++  if (ram_mb <= size_t(8192)) {
++    /* Shared-memory iGPUs and <=8 GB laptops benefit from prompt eviction of
++     * unused GPU resources (was 120 s timeout, 60 s collect rate). */
++    userdef->textimeout = 30;
++    userdef->texcollectrate = 15;
++    userdef->vbotimeout = 30;
++    userdef->vbocollectrate = 15;
++  }
+ 
+   /* Cap default undo stack proportionally to physical RAM (256 MB on <=4 GB,
+    * 512 MB on 8 GB, 1024 MB on 16 GB, up to 2048 MB). The DNA default stays 0
