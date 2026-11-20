@@ -55,9 +55,20 @@ jobs:
       - name: Clone Blender v5.2.4 (shallow)
         run: git clone --depth 1 --branch v5.2.4 https://projects.blender.org/blender/blender.git blender-source
 
+      - name: Pre-seed Windows prebuilt libraries
+        working-directory: blender-source
+        shell: cmd
+        run: |
+          git lfs install --skip-repo || exit /b 1
+          git config --local submodule.lib/windows_x64.update checkout || exit /b 1
+          set GIT_LFS_SKIP_SMUDGE=1
+          git submodule update --progress --init lib/windows_x64 || exit /b 1
+          set GIT_LFS_SKIP_SMUDGE=
+          git -C lib/windows_x64 lfs pull || exit /b 1
+
       - name: Get prebuilt libraries
         working-directory: blender-source
-        run: echo y | make update
+        run: make update
         shell: cmd
 
       - name: Apply Stephender patches
