@@ -97,6 +97,47 @@ jobs:
           ..\build_windows_x64_vc17_Release\bin\blender.exe --version
           ..\build_windows_x64_vc17_Release\bin\blender.exe --background --factory-startup --python-expr "import bpy; print('objects:', len(bpy.data.objects)); print('undo_mem_limit:', bpy.context.preferences.edit.undo_memory_limit)"
 
+      - name: Regression test — Blender bl_global_undo.py
+        working-directory: blender-source
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path ..\test-out\global_undo | Out-Null
+          ..\build_windows_x64_vc17_Release\bin\blender.exe --background --factory-startup --python-exit-code 1 `
+            --python tests\python\bl_global_undo.py -- `
+            --src-test-dir tests `
+            --output-dir ..\test-out\global_undo
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Regression test — undo_runtime_test.py
+        working-directory: blender-source
+        shell: powershell
+        run: |
+          ..\build_windows_x64_vc17_Release\bin\blender.exe --background --factory-startup --python-exit-code 1 `
+            --python ..\bench\undo_runtime_test.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Cache BMW27 regression scene
+        uses: actions/cache@v4
+        with:
+          path: .ci-scenes
+          key: bmw27-scene-v1
+
+      - name: Regression test — BMW27 64-sample smoke render
+        working-directory: blender-source
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path ..\.ci-scenes | Out-Null
+          if (-not (Test-Path ..\.ci-scenes\BMW27.blend)) {
+            Invoke-WebRequest -Uri https://download.blender.org/demo/test/BMW27.blend.zip -OutFile ..\.ci-scenes\BMW27.blend.zip
+            Expand-Archive -Path ..\.ci-scenes\BMW27.blend.zip -DestinationPath ..\.ci-scenes -Force
+            Remove-Item -Force ..\.ci-scenes\BMW27.blend.zip
+            Remove-Item -Recurse -Force ..\.ci-scenes\__MACOSX -ErrorAction SilentlyContinue
+          }
+          ..\build_windows_x64_vc17_Release\bin\blender.exe --background --factory-startup --python-exit-code 1 `
+            --python ..\bench\post_render_rss.py -- `
+            --scene ..\.ci-scenes\BMW27.blend --samples 64 --wait 0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Package
         working-directory: blender-source
         shell: powershell

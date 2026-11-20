@@ -52,15 +52,17 @@ def main():
     # ru_maxrss of children (max RSS of the largest waited-for child, kB on Linux)
     import resource
 
-    ru = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    ru = resource.getrusage(resource.RUSAGE_CHILDREN)
     print(json.dumps({
         "label": label,
         "cmd": " ".join(cmd),
         "returncode": proc.returncode,
         "wall_seconds": round(wall, 2),
+        "user_cpu_seconds": round(ru.ru_utime, 2),
+        "system_cpu_seconds": round(ru.ru_stime, 2),
         "peak_rss_kb_polled": peak_kb,
         "peak_rss_mb_polled": round(peak_kb / 1024, 1),
-        "ru_maxrss_mb_children": round(ru / 1024, 1),
+        "ru_maxrss_mb_children": round(ru.ru_maxrss / 1024, 1),
         "log": logfile,
     }))
 

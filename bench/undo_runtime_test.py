@@ -8,6 +8,7 @@
 # Run: blender --background --factory-startup --python undo_runtime_test.py
 import bpy
 import mathutils
+import sys
 import time
 
 
@@ -119,14 +120,18 @@ def run_edge_probe():
           f"rss_peak={vm_hwm_mb():.0f}MB loc.x={ob.location.x}", flush=True)
     r_undo = bpy.ops.ed.undo()
     loc_after = bpy.data.objects["Cube"].location.x
+    edge_ok = (r_undo == {'FINISHED'} and loc_after == 0.0)
     print(f"[{limit}] edge probe RESULT: undo_ret={r_undo} loc.x after undo={loc_after} "
-          f"(expect 0.0 if undo works) UNDO_WORKS={r_undo == {'FINISHED'} and loc_after == 0.0}",
+          f"(expect 0.0 if undo works) UNDO_WORKS={edge_ok}",
           flush=True)
+    return edge_ok
 
 
 print("=== Proposal 1 runtime test (prebuilt binary, no build) ===", flush=True)
 results = {}
 for limit in (0, 256, 512):
     results[limit] = run_scenario(limit)
-run_edge_probe()
-print(f"=== SUMMARY: {results} ===", flush=True)
+edge_ok = run_edge_probe()
+all_ok = all(results.values()) and edge_ok
+print(f"=== SUMMARY: {results} edge_probe={edge_ok} PASS={all_ok} ===", flush=True)
+sys.exit(0 if all_ok else 1)

@@ -82,6 +82,40 @@ jobs:
           ../build_linux/bin/blender --version
           ../build_linux/bin/blender --background --factory-startup --python-expr "import bpy; print('objects:', len(bpy.data.objects)); print('undo_mem_limit:', bpy.context.preferences.edit.undo_memory_limit)"
 
+      - name: Regression test — Blender bl_global_undo.py
+        working-directory: blender-source
+        run: |
+          mkdir -p ../test-out/global_undo
+          ../build_linux/bin/blender --background --factory-startup --python-exit-code 1 \
+            --python tests/python/bl_global_undo.py -- \
+            --src-test-dir tests \
+            --output-dir ../test-out/global_undo
+
+      - name: Regression test — undo_runtime_test.py
+        working-directory: blender-source
+        run: |
+          ../build_linux/bin/blender --background --factory-startup --python-exit-code 1 \
+            --python ../bench/undo_runtime_test.py
+
+      - name: Cache BMW27 regression scene
+        uses: actions/cache@v4
+        with:
+          path: .ci-scenes
+          key: bmw27-scene-v1
+
+      - name: Regression test — BMW27 64-sample smoke render
+        working-directory: blender-source
+        run: |
+          mkdir -p ../.ci-scenes
+          if [ ! -f ../.ci-scenes/BMW27.blend ]; then
+            curl -fsSL -o ../.ci-scenes/BMW27.blend.zip https://download.blender.org/demo/test/BMW27.blend.zip
+            python3 -c "import zipfile; zipfile.ZipFile('../.ci-scenes/BMW27.blend.zip').extract('BMW27.blend', '../.ci-scenes')"
+            rm -f ../.ci-scenes/BMW27.blend.zip
+          fi
+          ../build_linux/bin/blender --background --factory-startup --python-exit-code 1 \
+            --python ../bench/post_render_rss.py -- \
+            --scene ../.ci-scenes/BMW27.blend --samples 64 --wait 0
+
       - name: Package
         working-directory: blender-source
         run: |
