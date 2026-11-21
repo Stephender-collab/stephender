@@ -119,6 +119,37 @@ jobs:
       - name: Package
         working-directory: blender-source
         run: |
+          # Stephender Phase 2 Fix 5: strip unstripped runtime binaries (preserves
+          # .dynsym for Python C extensions and leaves prebuilt .so libraries and any
+          # GPU kernels such as libcycles_kernel_oneapi_aot.so and
+          # 5.2/scripts/addons_core/cycles/lib/* untouched).
+          BIN_DIR=../build_linux/bin
+          for bin_path in \
+            "$BIN_DIR/blender" \
+            "$BIN_DIR/5.2/python/bin/python3.13" \
+            "$BIN_DIR/lib/libbf_intern_draco_bridge.so" \
+            "$BIN_DIR/lib/libbf_intern_meshopt_bridge.so" \
+            "$BIN_DIR/lib/libblender_cpu_check.so"; do
+            if [ -f "$bin_path" ] && [ ! -L "$bin_path" ]; then
+              strip --strip-unneeded "$bin_path"
+            fi
+          done
+
+          # Belt-and-suspenders guard in case any static libpython archive remains
+          # (already excluded by CMake install rules in 0006-packaging-trim.patch).
+          rm -f "$BIN_DIR"/5.2/python/lib/libpython*.a \
+                "$BIN_DIR"/5.2/python/lib/python*/config-*/libpython*.a
+
+          # Post-strip sanity check (avoid writing extra __pycache__ before tarring).
+          PYTHONDONTWRITEBYTECODE=1 "$BIN_DIR/blender" --version
+          PYTHONDONTWRITEBYTECODE=1 "$BIN_DIR/blender" --background --factory-startup --python-exit-code 1 \
+            --python-expr "import bpy, numpy, openvdb, pxr, io_scene_gltf2; assert io_scene_gltf2.is_draco_available(); assert io_scene_gltf2.is_meshopt_available(); print('Post-strip smoke OK')"
+          PYTHONDONTWRITEBYTECODE=1 "$BIN_DIR/5.2/python/bin/python3.13" -c "import numpy, ssl; print('Post-strip python OK')"
+
+          echo "Uncompressed package size (bytes / MiB):"
+          du -sb "$BIN_DIR/blender" "$BIN_DIR/5.2" "$BIN_DIR/lib" | awk '{s+=$1; print} END {printf "TOTAL_BYTES=%d (%.1f MiB)\n", s, s/1048576}'
+          du -sm "$BIN_DIR/blender" "$BIN_DIR/5.2" "$BIN_DIR/lib"
+
           tar -cJf stephender-linux-x64.tar.xz -C ../build_linux/bin blender 5.2 lib
           sha256sum stephender-linux-x64.tar.xz | tee stephender-linux-x64.tar.xz.sha256
           ls -lh stephender-linux-x64.tar.xz

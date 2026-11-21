@@ -179,9 +179,49 @@ jobs:
         working-directory: blender-source
         shell: powershell
         run: |
-          Compress-Archive -Path ..\build_windows_x64_vc17_Release\bin\* -DestinationPath stephender-windows-x64.zip
+          $bin = "..\build_windows_x64_vc17_Release\bin"
+
+          # Stephender Phase 2 Fix 5: ship blender.pdb as a separate debug asset
+          # instead of bundling ~134 MiB of symbols inside the main user zip.
+          $pdb = Join-Path $bin "blender.pdb"
+          if (Test-Path $pdb) {
+            Compress-Archive -Path $pdb -DestinationPath stephender-windows-x64-pdb.zip -Force
+            (Get-FileHash stephender-windows-x64-pdb.zip -Algorithm SHA256).Hash | Out-File stephender-windows-x64-pdb.zip.sha256
+            Get-ChildItem stephender-windows-x64-pdb.zip | Select-Object Name, Length
+          }
+
+          # Remove non-runtime build-time host tools and debug/linker artifacts from bin\.
+          # These leak into bin\ because Ninja's EXECUTABLE_OUTPUT_PATH matches CMAKE_INSTALL_PREFIX.
+          # Preserves blender.shared\, blender.crt\, 5.2\ (incl. any Cycles GPU kernels), and all runtime DLLs/EXEs.
+          $topJunk = @(
+            "*.pdb",
+            "*.lib",
+            "*.exp",
+            "makesrna.exe",
+            "makesdna.exe",
+            "msgfmt.exe",
+            "datatoc.exe",
+            "shader_tool.exe",
+            "zstd_compress.exe"
+          )
+          foreach ($pat in $topJunk) {
+            Get-ChildItem -Path $bin -Filter $pat -File -ErrorAction SilentlyContinue | Remove-Item -Force
+          }
+
+          # Belt-and-suspenders guard in case any .pdb remains under bundled Python
+          # (already excluded by CMake install rules in 0006-packaging-trim.patch).
+          Get-ChildItem -Path (Join-Path $bin "5.2\python") -Filter "*.pdb" -Recurse -File -ErrorAction SilentlyContinue | Remove-Item -Force
+
+          # Post-trim smoke check and uncompressed size report.
+          $env:PYTHONDONTWRITEBYTECODE = "1"
+          & (Join-Path $bin "blender.exe") --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $uncompressedBytes = (Get-ChildItem -Path $bin -Recurse -File | Measure-Object -Property Length -Sum).Sum
+          Write-Output "STEPHENDER-WIN-UNCOMPRESSED-BYTES=$uncompressedBytes ($([math]::Round($uncompressedBytes/1MB,1)) MiB)"
+
+          Compress-Archive -Path "$bin\*" -DestinationPath stephender-windows-x64.zip -Force
           (Get-FileHash stephender-windows-x64.zip -Algorithm SHA256).Hash | Out-File stephender-windows-x64.zip.sha256
-          Get-ChildItem stephender-windows-x64.zip | Select-Object Length
+          Get-ChildItem stephender-windows-x64.zip | Select-Object Name, Length
 
       - name: Upload build artifact (kept 30 days)
         uses: actions/upload-artifact@v4
@@ -192,6 +232,16 @@ jobs:
             blender-source/stephender-windows-x64.zip.sha256
           retention-days: 30
 
+      - name: Upload debug symbols artifact (kept 30 days)
+        uses: actions/upload-artifact@v4
+        with:
+          name: stephender-windows-x64-pdb
+          path: |
+            blender-source/stephender-windows-x64-pdb.zip
+            blender-source/stephender-windows-x64-pdb.zip.sha256
+          retention-days: 30
+          if-no-files-found: ignore
+
       # Publishing to a GitHub Release happens on release events only.
       - name: Publish to GitHub Release
         if: github.event_name == 'release'
@@ -200,3 +250,5 @@ jobs:
           files: |
             blender-source/stephender-windows-x64.zip
             blender-source/stephender-windows-x64.zip.sha256
+            blender-source/stephender-windows-x64-pdb.zip
+            blender-source/stephender-windows-x64-pdb.zip.sha256

@@ -1,0 +1,162 @@
+From: Stephender (Antigravity Phase 2, Fix 5 — packaging & binary trim)
+Subject: [PATCH] Trim packaging bloat and enable Release dead-section elimination
+
+Phase 2 Fix 5 from ANTIGRAVITY-PLAN.md. Applies cleanly on top of
+0001-undo-hardening + 0002-physical-ram + 0003-ram-aware-cache +
+0004-tbb-trim-thp-guard + 0005-startup-ram-lazy-loading against
+Blender v5.2.4 (cd5dc428cce1).
+
+100% of features preserved. No add-ons, locales, Cycles GPU kernels
+(5.2/scripts/addons_core/cycles/lib/* or lib/libcycles_kernel_oneapi_aot.so),
+or Python docstrings (-OO) are removed or altered.
+
+Summary of changes
+------------------
+1. source/creator/CMakeLists.txt (Python install exclusions):
+   - Linux/Unix `install_dir()` and system-Python fallback:
+     Upstream `PATTERN "config-${PYTHON_VERSION}/*.a" EXCLUDE` missed both
+     multiarch config directories (`config-3.13-x86_64-linux-gnu/libpython3.13.a`,
+     84,181,888 bytes) and the top-level copy (`lib/libpython3.13.a`,
+     84,181,888 bytes). Update to `PATTERN "config-${PYTHON_VERSION}*/*.a" EXCLUDE`
+     and `PATTERN "libpython*.a" EXCLUDE`.
+     Measured saving on fix4-linux: -168,363,776 bytes (-160.56 MiB).
+     Preserves numpy's small static libs (126 KB) and all Python runtime files.
+   - Windows Release/RelWithDebInfo/MinSizeRel Python `lib` install:
+     Add `PATTERN "*.pdb" EXCLUDE` (matching the existing `DLLs` install rule
+     directly below it) to exclude `venvlauncher.pdb` (3,829,760 bytes) and
+     `venvwlauncher.pdb` (3,846,144 bytes). Debug config is untouched.
+     Measured saving on fix4-windows: -7,675,904 bytes (-7.32 MiB).
+
+2. build_files/cmake/platform/platform_win32.cmake (MSVC /Gy /OPT:REF /OPT:ICF):
+   - Upstream already passes `/OPT:REF /OPT:ICF /INCREMENTAL:NO` via
+     `PDB_INFO_OVERRIDE_LINKER_FLAGS` when `WITH_WINDOWS_RELEASE_PDB=ON`, and
+     already passes `/Gy` for `MSVC_CLANG`, but omitted `/Gy` for standard
+     MSVC `cl.exe` (preventing per-function dead-code stripping / COMDAT folding).
+   - Add `/Gy` to `CMAKE_C_FLAGS_RELEASE`, `CMAKE_CXX_FLAGS_RELEASE`,
+     `CMAKE_C_FLAGS_MINSIZEREL`, and `CMAKE_CXX_FLAGS_MINSIZEREL` when
+     `NOT MSVC_CLANG`, and preserve `/OPT:REF /OPT:ICF /INCREMENTAL:NO` in
+     `PDB_INFO_OVERRIDE_LINKER_FLAGS` even if `WITH_WINDOWS_RELEASE_PDB=OFF`.
+   - `WITH_WINDOWS_RELEASE_PDB` remains ON so CI still produces `blender.pdb`
+     for upload as a separate debug asset.
+   - Exact `blender.exe` size reduction is unmeasured until Windows CI builds.
+
+3. build_files/cmake/platform/platform_unix.cmake (GCC/Clang gc-sections):
+   - Add `-ffunction-sections -fdata-sections` to Release/MinSizeRel C/C++
+     flags and `-Wl,--gc-sections` to `PLATFORM_LINKFLAGS_RELEASE` for GNU and
+     Clang compilers (when `NOT WITH_COMPILER_ASAN`).
+   - Verified against GNU ld with `-Xlinker -export-dynamic` and
+     `-Wl,--version-script=symbols_unix.map` that exported `Py*`/`_Py*`
+     symbols remain GC roots while unreferenced local symbols are discarded.
+   - Exact `blender` size reduction is unmeasured until Linux CI builds.
+
+Paired workflow edits (staged separately in phase2-fix5-workflow-edits.diff):
+- Linux: `strip --strip-unneeded` on explicit runtime ELF allow-list
+  (`blender`, `5.2/python/bin/python3.13`, `libbf_intern_draco_bridge.so`,
+  `libbf_intern_meshopt_bridge.so`, `libblender_cpu_check.so` — saving
+  115,080,072 bytes / 109.75 MiB measured on fix4-linux, never touching
+  prebuilt `.so`s or `libcycles_kernel_oneapi_aot.so`).
+- Windows: package `blender.pdb` (140,316,672 bytes / 133.82 MiB) as a
+  separate debug asset (`stephender-windows-x64-pdb.zip`) and exclude top-level
+  `.pdb`/`.lib`/`.exp` and build-time host tools (`makesrna.exe`, `makesdna.exe`,
+  `msgfmt.exe`, `datatoc.exe`, `shader_tool.exe`, `zstd_compress.exe`) from
+  the main user zip (saving 165,810,154 bytes / 158.13 MiB on top of CMake's
+  7.32 MiB Python PDB exclusion = 173,486,058 bytes / 165.45 MiB total).
+
+STATUS: STAGED - verified full-stack apply (0001->0002->0003->0004->0005->this)
+in scratch against Blender v5.2.4 (cd5dc428cce1), diff vs drafted tree empty.
+NOT yet in stephender-repo/patches/.
+
+diff --git a/build_files/cmake/platform/platform_unix.cmake b/build_files/cmake/platform/platform_unix.cmake
+index 4719eb4..d2443c9 100644
+--- a/build_files/cmake/platform/platform_unix.cmake
++++ b/build_files/cmake/platform/platform_unix.cmake
+@@ -1036,6 +1036,18 @@ endif()
+ 
+ unset(_IS_LINKER_DEFAULT)
+ 
++# Stephender Phase 2 Fix 5: emit per-function/per-data sections in Release/MinSizeRel
++# and garbage-collect unreferenced sections when linking `blender`.
++# Exported `Py*`/`_Py*` symbols from `symbols_unix.map` remain GC roots under
++# `-Xlinker -export-dynamic` + `-Wl,--version-script`.
++if(((CMAKE_C_COMPILER_ID STREQUAL "GNU") OR (CMAKE_C_COMPILER_ID MATCHES "Clang")) AND NOT WITH_COMPILER_ASAN)
++  string(APPEND CMAKE_C_FLAGS_RELEASE " -ffunction-sections -fdata-sections")
++  string(APPEND CMAKE_CXX_FLAGS_RELEASE " -ffunction-sections -fdata-sections")
++  string(APPEND CMAKE_C_FLAGS_MINSIZEREL " -ffunction-sections -fdata-sections")
++  string(APPEND CMAKE_CXX_FLAGS_MINSIZEREL " -ffunction-sections -fdata-sections")
++  string(APPEND PLATFORM_LINKFLAGS_RELEASE " -Wl,--gc-sections")
++endif()
++
+ # Avoid conflicts with Mesa llvmpipe, Luxrender, and other plug-ins that may
+ # use the same libraries as Blender with a different version or build options.
+ set(PLATFORM_SYMBOLS_MAP ${CMAKE_SOURCE_DIR}/source/creator/symbols_unix.map)
+diff --git a/build_files/cmake/platform/platform_win32.cmake b/build_files/cmake/platform/platform_win32.cmake
+index 1ed0c53..31e7ef1 100644
+--- a/build_files/cmake/platform/platform_win32.cmake
++++ b/build_files/cmake/platform/platform_win32.cmake
+@@ -275,16 +275,28 @@ endif()
+ if(WITH_WINDOWS_RELEASE_PDB)
+   set(PDB_INFO_OVERRIDE_FLAGS "${SYMBOL_FORMAT_RELEASE}")
+   set(PDB_INFO_OVERRIDE_LINKER_FLAGS "/DEBUG /OPT:REF /OPT:ICF /INCREMENTAL:NO")
++else()
++  # Ensure Release builds still dead-strip and fold COMDATs when PDB generation is disabled.
++  set(PDB_INFO_OVERRIDE_LINKER_FLAGS "/OPT:REF /OPT:ICF /INCREMENTAL:NO")
++endif()
++
++# Stephender Phase 2 Fix 5: enable function-level linking (/Gy) in Release/MinSizeRel
++# for MSVC cl.exe so /OPT:REF and /OPT:ICF can eliminate unreferenced functions and
++# fold identical COMDATs at function granularity (clang-cl already sets /Gy above).
++set(_MSVC_RELEASE_COMDAT_FLAG "")
++if(NOT MSVC_CLANG)
++  set(_MSVC_RELEASE_COMDAT_FLAG " /Gy")
+ endif()
+ 
+ string(APPEND CMAKE_CXX_FLAGS_DEBUG " /MDd ${SYMBOL_FORMAT}")
+ string(APPEND CMAKE_C_FLAGS_DEBUG " /MDd ${SYMBOL_FORMAT}")
+-string(APPEND CMAKE_CXX_FLAGS_RELEASE " /MD ${PDB_INFO_OVERRIDE_FLAGS}")
+-string(APPEND CMAKE_C_FLAGS_RELEASE " /MD ${PDB_INFO_OVERRIDE_FLAGS}")
+-string(APPEND CMAKE_CXX_FLAGS_MINSIZEREL " /MD ${PDB_INFO_OVERRIDE_FLAGS}")
+-string(APPEND CMAKE_C_FLAGS_MINSIZEREL " /MD ${PDB_INFO_OVERRIDE_FLAGS}")
++string(APPEND CMAKE_CXX_FLAGS_RELEASE " /MD${_MSVC_RELEASE_COMDAT_FLAG} ${PDB_INFO_OVERRIDE_FLAGS}")
++string(APPEND CMAKE_C_FLAGS_RELEASE " /MD${_MSVC_RELEASE_COMDAT_FLAG} ${PDB_INFO_OVERRIDE_FLAGS}")
++string(APPEND CMAKE_CXX_FLAGS_MINSIZEREL " /MD${_MSVC_RELEASE_COMDAT_FLAG} ${PDB_INFO_OVERRIDE_FLAGS}")
++string(APPEND CMAKE_C_FLAGS_MINSIZEREL " /MD${_MSVC_RELEASE_COMDAT_FLAG} ${PDB_INFO_OVERRIDE_FLAGS}")
+ string(APPEND CMAKE_CXX_FLAGS_RELWITHDEBINFO " /MD ${SYMBOL_FORMAT_RELEASE}")
+ string(APPEND CMAKE_C_FLAGS_RELWITHDEBINFO " /MD ${SYMBOL_FORMAT_RELEASE}")
++unset(_MSVC_RELEASE_COMDAT_FLAG)
+ unset(SYMBOL_FORMAT)
+ unset(SYMBOL_FORMAT_RELEASE)
+ 
+diff --git a/source/creator/CMakeLists.txt b/source/creator/CMakeLists.txt
+index 7e2c453..5d9596a 100644
+--- a/source/creator/CMakeLists.txt
++++ b/source/creator/CMakeLists.txt
+@@ -735,7 +735,10 @@ function(install_dir from to)
+     PATTERN "__MACOSX" EXCLUDE
+     PATTERN ".DS_Store" EXCLUDE
+     # Unneeded Python files.
+-    PATTERN "config-${PYTHON_VERSION}/*.a" EXCLUDE  # static lib
++    # Match both multiarch config dirs (e.g. `config-3.13-x86_64-linux-gnu/libpython3.13.a`)
++    # and the top-level static archive (`lib/libpython3.13.a`) in precompiled libs.
++    PATTERN "config-${PYTHON_VERSION}*/*.a" EXCLUDE  # static lib
++    PATTERN "libpython*.a" EXCLUDE                   # static lib
+     PATTERN "lib2to3" EXCLUDE                   # ./lib2to3
+     PATTERN "tkinter" EXCLUDE                   # ./tkinter
+     PATTERN "lib-dynload/_tkinter.*" EXCLUDE    # ./lib-dynload/_tkinter.co
+@@ -883,7 +886,8 @@ if(UNIX AND NOT APPLE)
+         DIRECTORY ${PYTHON_LIBPATH}/python${PYTHON_VERSION}
+         DESTINATION ${TARGETDIR_VER}/python/${_target_LIB}
+         PATTERN "__pycache__" EXCLUDE               # * any cache *
+-        PATTERN "config-${PYTHON_VERSION}/*.a" EXCLUDE  # static lib
++        PATTERN "config-${PYTHON_VERSION}*/*.a" EXCLUDE  # static lib
++        PATTERN "libpython*.a" EXCLUDE                   # static lib
+         PATTERN "lib2to3" EXCLUDE                   # ./lib2to3
+         PATTERN "site-packages/*" EXCLUDE           # ./site-packages/*
+         PATTERN "tkinter" EXCLUDE                   # ./tkinter
+@@ -1299,6 +1303,7 @@ elseif(WIN32)
+         DIRECTORY ${LIBDIR}/python/${_PYTHON_VERSION_NO_DOTS}/lib
+         DESTINATION ${BLENDER_VERSION}/python/
+         CONFIGURATIONS Release;RelWithDebInfo;MinSizeRel
++        PATTERN "*.pdb" EXCLUDE                 # * debug symbols (matches DLLs rule below) *
+         PATTERN "*_d.*" EXCLUDE                 # * debug libraries *
+         PATTERN "__pycache__" EXCLUDE           # * any cache *
+         PATTERN "*.pyc" EXCLUDE                 # * any cache *

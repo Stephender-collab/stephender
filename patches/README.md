@@ -44,8 +44,25 @@ Currently in:
   tests. Unverified until CI: MSVC link, Windows runtime RSS, full
   C++ compile of osl.cpp.)
 
+- `0006-packaging-trim.patch` (Phase 2 Fix 5, packaging trim: CMake
+  excludes both copies of libpython3.13.a (2 × 84,181,888 B) and Windows
+  Python venv PDBs; Linux -ffunction-sections/-fdata-sections +
+  -Wl,--gc-sections on the blender link; Windows /Gy for MSVC cl.exe;
+  workflow strips an explicit 5-file ELF allow-list on Linux and ships
+  blender.pdb as a separate debug asset on Windows, dropping top-level
+  .pdb/.lib/.exp + 6 build-time host tools. GPU kernels untouched —
+  strip never touches libcycles_kernel_oneapi_aot.so or
+  cycles/lib/*. Expected: Linux ~890–910 MB installed (from 1,182 MB),
+  Windows ~733 MB uncompressed (from 883 MB). Muse verified the staged
+  patch independently before landing: full-stack apply 0001→0006 clean,
+  every claimed file size matches the real fix4 artifacts byte-for-byte,
+  PLATFORM_LINKFLAGS_RELEASE reaches the blender link, workflow diff
+  applies on ec93a84 with the Windows startup-measurement step
+  preserved. CI is the real test for the gc-sections / /Gy link.)
+
 Phase 1 is complete (0001–0004, all green + measured). Phase 2 is
-underway (0005 landed; Fix 5 packaging trim is next).
+complete (0005 + 0006 landed) once the 0006 builds go green and the
+packaged sizes are verified from the CI artifacts.
 
 Superseded and NOT included: `phase2-proposal1-undomemory-256.patch` (the
 one-line default flip — not a hard cap, can leave zero usable undo steps).
