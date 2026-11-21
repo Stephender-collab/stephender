@@ -1,0 +1,306 @@
+From: Stephender (Antigravity lead-planner proposal, Phase 1 Fix 3, v2 rework)
+Subject: [PATCH] Return freed TBB allocator pools to the OS + guard huge pages on low-RAM systems
+
+Fix 3 from ANTIGRAVITY-PLAN.md. Applies on top of 0001-undo-hardening +
+0002-ram-aware-cache against Blender v5.2.4 (cd5dc428cce1).
+
+Blender links tbbmalloc_proxy on Linux and Windows x64 but never calls
+scalable_allocation_command(TBBMALLOC_CLEAN_ALL_BUFFERS, nullptr) to
+release idle allocator caches, so RSS stays high after a render, a file
+load, or undo purges. This adds MEM_trim_unused() and calls it on cold
+paths only: after undo steps are purged, at the end of
+wm_file_read_post(), and at the end of RE_RenderFrame() / RE_RenderAnim().
+It also gates Linux Transparent Huge Pages on >8 GiB physical RAM (was
+unconditional).
+
+Preserved corrections from v1:
+1. Defines -DWITH_TBB_MALLOC and adds TBB include dirs in
+   intern/guardedalloc/CMakeLists.txt (on Linux, WITH_TBB_MALLOC is
+   otherwise only defined for source/creator/CMakeLists.txt:139-141).
+2. Calls MEM_trim_unused() at the end of RE_RenderFrame()
+   (pipeline.cc:1925..2009) and RE_RenderAnim() (pipeline.cc:2318..2612)
+   since render_endjob() lives in editors/render/render_internal.cc, not
+   pipeline.cc.
+
+Changes vs v1 (rework):
+1. Defect 1 (link failure on msgfmt and guardedalloc gtests) — fixed via
+   Option (a): link `PRIVATE ${TBB_MALLOC_LIBRARIES}` directly in
+   intern/guardedalloc/CMakeLists.txt under
+   `if(WITH_TBB_MALLOC_PROXY AND TBB_MALLOC_LIBRARIES AND TBB_INCLUDE_DIRS)`.
+   Why this links on BOTH Linux and Windows (traced in upstream v5.2.4):
+   - Option & evaluation order: CMakeLists.txt:764-766 defines
+     WITH_TBB_MALLOC_PROXY (default ON on Linux and Windows x64; unset on
+     macOS and Windows ARM64). CMakeLists.txt:1542-1544 includes
+     platform_unix / platform_win32 before add_subdirectory(intern) at
+     CMakeLists.txt:2434, so TBB_* variables are already populated when
+     intern/guardedalloc/CMakeLists.txt runs.
+   - Linux: build_files/cmake/platform/platform_unix.cmake:499-511 sets
+     TBB_INCLUDE_DIRS (line 505) and TBB_MALLOC_LIBRARIES from
+     TBB::tbbmalloc LOCATION (line 509); line 520 calls
+     add_bundled_libraries(tbb/lib), putting tbb/lib on LD_LIBRARY_PATH in
+     PLATFORM_ENV_BUILD (platform_unix.cmake:1105-1109) for build-time
+     tools like msgfmt (build_files/cmake/macros.cmake:1217).
+   - Windows: CMakeLists.txt:1137 defaults WITH_WINDOWS_FIND_MODULES to
+     OFF, so build_files/cmake/platform/platform_win32.cmake:779-810 takes
+     the bundled-libs branch and sets TBB_INCLUDE_DIRS (line 802) and
+     TBB_MALLOC_LIBRARIES (`optimized ${LIBDIR}/tbb/lib/tbbmalloc.lib
+     debug ${LIBDIR}/tbb/lib/tbbmalloc_debug.lib`, lines 804-807).
+     platform_win32.cmake:1209-1210 puts ${LIBDIR}/tbb/bin on PATH in
+     PLATFORM_ENV_BUILD (for msgfmt) and line 1215 includes it in
+     PLATFORM_ENV_INSTALL (for ctest).
+   - CMake keyword handling & transitive link propagation:
+     blender_add_lib() -> blender_link_libraries()
+     (build_files/cmake/macros.cmake:395-424) explicitly parses PRIVATE,
+     optimized, and debug tokens in LIB and defers bf::dependencies::*
+     (pthreads) to the end, keeping tbbmalloc before pthreads. Because
+     bf_intern_guardedalloc is a static library, CMake propagates its
+     PRIVATE link libraries via $<LINK_ONLY:...> to every consumer,
+     including targets without setup_platform_linker_libs() such as msgfmt
+     (source/blender/blentranslation/msgfmt/CMakeLists.txt:22,36),
+     guardedalloc_test (intern/guardedalloc/CMakeLists.txt:64, which also
+     passes ${LIB} directly), and all gtests
+     (build_files/cmake/testing.cmake:95).
+   - Guard safety: checking `TBB_MALLOC_LIBRARIES AND TBB_INCLUDE_DIRS`
+     ensures -DWITH_TBB_MALLOC is never defined without matching headers
+     and link library (covering macOS, Windows ARM64, WITH_TBB=OFF,
+     bpy_module/blender_lite, and non-default Windows builds with
+     WITH_WINDOWS_FIND_MODULES=ON where platform_win32.cmake:781-789
+     leaves TBB_MALLOC_LIBRARIES empty).
+2. Defect 2 (header blast radius / ccache+sccache invalidation) — moved
+   the MEM_trim_unused() declaration out of MEM_guardedalloc.h into a new
+   dedicated header intern/guardedalloc/MEM_trim.h (listed in SRC in
+   intern/guardedalloc/CMakeLists.txt) included ONLY by the 4 intended
+   translation units: mallocn.cc, undo_system.cc, pipeline.cc, wm_files.cc.
+   MEM_guardedalloc.h is completely untouched (byte-identical to upstream).
+3. Bonus v1 bug fixed (CMake INC_SYS wipe + strict flags ordering):
+   - In v1, `list(APPEND INC_SYS ${TBB_INCLUDE_DIRS})` ran at line 12 of
+     intern/guardedalloc/CMakeLists.txt, BEFORE `set(INC_SYS )` at line
+     17, which immediately cleared INC_SYS back to empty. Moved the block
+     after `set(LIB ...)` (line 45) so both INC_SYS and LIB persist into
+     blender_add_lib() and blender_add_test_suite_executable().
+   - In intern/guardedalloc/intern/mallocn.cc, moved `#include "MEM_trim.h"`
+     and `#include <tbb/scalable_allocator.h>` / `#include <malloc.h>`
+     above `BLI_strict_flags.h` so third-party headers are not compiled
+     under Blender's strict conversion/shadow error pragmas.
+4. Bonus v1 bug fixed (Linux THP RAM check was a no-op):
+   - BLI_system_memory_max_in_megabytes()
+     (source/blender/blenlib/intern/system.cc:208-216) returns maximum
+     addressable virtual memory (16 EiB on 64-bit), NOT physical RAM, so
+     `> 8192` was always true. Replaced with POSIX `sysconf(_SC_PAGESIZE)`
+     * `sysconf(_SC_PHYS_PAGES)` under `#if defined(WITH_TBB_MALLOC) &&
+     defined(__linux__)` (matching intern/cycles/util/system.cpp:262-264).
+
+Remaining risks / still to verify in CI:
+- Full Linux + Windows CI build & link (especially msgfmt, blender, and
+  WITH_GTESTS=ON targets such as guardedalloc_test) has not been executed
+  on this 6 GB VM (only mallocn.cc + MEM_trim.h + creator.cc sysconf
+  syntax/symbol compile-checked with g++ -std=c++20 -Wall -Wextra -Werror).
+- Non-default Windows builds with -DWITH_WINDOWS_FIND_MODULES=ON do not
+  populate TBB_MALLOC_LIBRARIES (platform_win32.cmake:781-789); the guard
+  keeps them building cleanly, with MEM_trim_unused() as a no-op.
+- Post-render, post-load, and post-undo-purge RSS benchmarks + zero
+  render-time regression check remain to be measured after CI builds.
+
+STATUS: STAGED (v2) - verified to apply cleanly on top of 0001 + 0002
+against Blender v5.2.4 (cd5dc428cce1). NOT yet in stephender-repo/patches/.
+
+diff --git a/intern/guardedalloc/CMakeLists.txt b/intern/guardedalloc/CMakeLists.txt
+index 2612f09..d001440 100644
+--- a/intern/guardedalloc/CMakeLists.txt
++++ b/intern/guardedalloc/CMakeLists.txt
+@@ -27,6 +27,7 @@ set(SRC
+ 
+   MEM_guardedalloc.h
+   MEM_safe_multiply.h
++  MEM_trim.h
+   ./intern/mallocn_inline.hh
+   ./intern/mallocn_intern.hh
+   ./intern/mallocn_intern_function_pointers.hh
+@@ -44,6 +45,16 @@ set(LIB
+   PRIVATE bf::dependencies::pthreads
+ )
+ 
++if(WITH_TBB_MALLOC_PROXY AND TBB_MALLOC_LIBRARIES AND TBB_INCLUDE_DIRS)
++  # MEM_trim_unused() calls scalable_allocation_command() directly in mallocn.cc.
++  # NOTE: On Linux, WITH_TBB_MALLOC is otherwise only defined for the creator target.
++  # Link TBB_MALLOC_LIBRARIES here so targets that link bf::intern::guardedalloc
++  # without setup_platform_linker_libs() (e.g. msgfmt, guardedalloc_test) also link cleanly.
++  add_definitions(-DWITH_TBB_MALLOC)
++  list(APPEND INC_SYS ${TBB_INCLUDE_DIRS})
++  list(APPEND LIB PRIVATE ${TBB_MALLOC_LIBRARIES})
++endif()
++
+ blender_add_lib(bf_intern_guardedalloc "${SRC}" "${INC}" "${INC_SYS}" "${LIB}")
+ add_library(bf::intern::guardedalloc ALIAS bf_intern_guardedalloc)
+ 
+diff --git a/intern/guardedalloc/MEM_trim.h b/intern/guardedalloc/MEM_trim.h
+new file mode 100644
+index 0000000..3965aa6
+--- /dev/null
++++ b/intern/guardedalloc/MEM_trim.h
+@@ -0,0 +1,27 @@
++/* SPDX-FileCopyrightText: 2026 Blender Authors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later */
++
++#pragma once
++
++/** \file
++ * \ingroup intern_mem
++ *
++ * Dedicated header for #MEM_trim_unused(), kept separate from `MEM_guardedalloc.h`
++ * so changes here do not invalidate compiler caches across the entire tree.
++ */
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/**
++ * Return freed allocator pools to the OS (TBB allocator caches, or glibc
++ * malloc arenas). Call only on cold paths (after a render, a file load, or
++ * undo steps being purged) -- never in a hot loop.
++ */
++void MEM_trim_unused(void);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/intern/guardedalloc/intern/mallocn.cc b/intern/guardedalloc/intern/mallocn.cc
+index 1de61c9..fdc8b9a 100644
+--- a/intern/guardedalloc/intern/mallocn.cc
++++ b/intern/guardedalloc/intern/mallocn.cc
+@@ -9,6 +9,13 @@
+  */
+ 
+ #include "MEM_guardedalloc.h"
++#include "MEM_trim.h"
++
++#ifdef WITH_TBB_MALLOC
++#  include <tbb/scalable_allocator.h>
++#elif defined(__GLIBC__)
++#  include <malloc.h>
++#endif
+ 
+ /* To ensure strict conversions. */
+ #include "../../source/blender/blenlib/BLI_strict_flags.h"
+@@ -230,3 +237,13 @@ void MEM_use_guarded_allocator()
+   MEM_name_ptr_set = MEM_guarded_name_ptr_set;
+ #endif
+ }
++
++void MEM_trim_unused()
++{
++#ifdef WITH_TBB_MALLOC
++  /* Release idle TBB allocator caches back to the OS. */
++  scalable_allocation_command(TBBMALLOC_CLEAN_ALL_BUFFERS, nullptr);
++#elif defined(__GLIBC__)
++  malloc_trim(0);
++#endif
++}
+diff --git a/source/blender/blenkernel/intern/undo_system.cc b/source/blender/blenkernel/intern/undo_system.cc
+index 235db21..de58e25 100644
+--- a/source/blender/blenkernel/intern/undo_system.cc
++++ b/source/blender/blenkernel/intern/undo_system.cc
+@@ -34,6 +34,7 @@
+ #include "RNA_access.hh"
+ 
+ #include "MEM_guardedalloc.h"
++#include "MEM_trim.h"
+ 
+ /* Header to pull symbols from the file which otherwise might get stripped away. */
+ #include "BKE_blender_undo.hh"
+@@ -488,6 +489,8 @@ void BKE_undosys_stack_limit_steps_and_memory(UndoStack *ustack, int steps, size
+     /* Free from first to last, free functions may update de-duplication info
+      * (see #MemFileUndoStep). */
+     undosys_stack_clear_all_first(ustack, us_trim_last, us_exclude);
++    /* Return freed allocator pools to the OS now that undo steps are gone. */
++    MEM_trim_unused();
+   }
+ }
+ 
+diff --git a/source/blender/render/intern/pipeline.cc b/source/blender/render/intern/pipeline.cc
+index 1761935..024cd03 100644
+--- a/source/blender/render/intern/pipeline.cc
++++ b/source/blender/render/intern/pipeline.cc
+@@ -26,6 +26,7 @@
+ #include "DNA_windowmanager_types.h"
+ 
+ #include "MEM_guardedalloc.h"
++#include "MEM_trim.h"
+ 
+ #include "BLI_fileops.h"
+ #include "BLI_listbase.h"
+@@ -2006,6 +2007,9 @@ void RE_RenderFrame(Render *re,
+ 
+   /* UGLY WARNING */
+   G.is_rendering = false;
++
++  /* Return freed allocator pools to the OS after the render finishes. */
++  MEM_trim_unused();
+ }
+ 
+ #ifdef WITH_FREESTYLE
+@@ -2609,6 +2613,9 @@ void RE_RenderAnim(Render *re,
+ 
+   /* UGLY WARNING */
+   G.is_rendering = false;
++
++  /* Return freed allocator pools to the OS after the animation render finishes. */
++  MEM_trim_unused();
+ }
+ 
+ void RE_PreviewRender(Render *re, Main *bmain, Scene *sce)
+diff --git a/source/blender/windowmanager/intern/wm_files.cc b/source/blender/windowmanager/intern/wm_files.cc
+index 686250c..a2a89d7 100644
+--- a/source/blender/windowmanager/intern/wm_files.cc
++++ b/source/blender/windowmanager/intern/wm_files.cc
+@@ -32,6 +32,7 @@
+ 
+ #include "MEM_CacheLimiterC-Api.h"
+ #include "MEM_guardedalloc.h"
++#include "MEM_trim.h"
+ 
+ #include "BLI_fileops.h"
+ #include "BLI_filereader.h"
+@@ -850,6 +851,9 @@ static void wm_file_read_post(bContext *C,
+       WM_toolsystem_init(C);
+     }
+   }
++
++  /* Return freed allocator pools to the OS now that the old file is gone. */
++  MEM_trim_unused();
+ }
+ 
+ static void wm_read_callback_pre_wrapper(bContext *C, const char *filepath)
+diff --git a/source/creator/creator.cc b/source/creator/creator.cc
+index 4253893..a572f66 100644
+--- a/source/creator/creator.cc
++++ b/source/creator/creator.cc
+@@ -115,6 +115,7 @@ char **environ = nullptr;
+ 
+ #if defined(WITH_TBB_MALLOC) && defined(__linux__)
+ #  include <tbb/scalable_allocator.h>
++#  include <unistd.h>
+ #endif
+ 
+ #include "creator_intern.h" /* Own include. */
+@@ -396,8 +397,16 @@ int main(int argc,
+ #endif
+ 
+ #if defined(WITH_TBB_MALLOC) && defined(__linux__)
+-  /* Enable huge pages for performance. */
+-  scalable_allocation_mode(TBBMALLOC_USE_HUGE_PAGES, 1);
++  /* Huge pages help on big-RAM machines but increase fragmentation/RSS on low-RAM hosts.
++   * Use sysconf(_SC_PHYS_PAGES) rather than BLI_system_memory_max_in_megabytes(), which
++   * returns virtual address space size (16 EiB on 64-bit) rather than physical RAM. */
++  const long page_size = sysconf(_SC_PAGESIZE);
++  const long phys_pages = sysconf(_SC_PHYS_PAGES);
++  if (page_size > 0 && phys_pages > 0 &&
++      (uint64_t(page_size) * uint64_t(phys_pages)) > (uint64_t(8192) * 1024 * 1024))
++  {
++    scalable_allocation_mode(TBBMALLOC_USE_HUGE_PAGES, 1);
++  }
+ #endif
+ 
+   /* NOTE: Special exception for guarded allocator type switch:

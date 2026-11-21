@@ -19,12 +19,18 @@ Currently in:
 - `0003-ram-aware-cache.patch` (Phase 1 Fix 2, cache limit + GPU GC
   scaled from real physical RAM: <=8 GB machines get memcachelimit
   ram/8 clamped 256–1024 MB and 30s/15s cleanup timeouts; >8 GB
-  machines exactly upstream (ram/2 up to the 4096 MB default))
+  machines exactly upstream (ram/2 up to the 4096 MB default);
+  commit dabc0ac, pushed 2026-11-20; both builds green — Linux
+  smoke test printed undo_mem_limit 981, Windows 1023; factory
+  defaults verified on the 0003 Linux binary on a 7.9 GB machine:
+  memcachelimit 991, timeouts 30/15/30/15, undo 495)
+- `0004-tbb-trim-thp-guard.patch` (Phase 1 Fix 3 v2, allocator trim
+  after undo purge / file load / render + huge-pages guard on
+  >8 GB machines only; v2 reworked + verified, full stack
+  0001→0002→0003→0004 applies clean in scratch)
 
-Still staged in the parent project folder, one per cycle:
-- `../phase1-fix3-tbb-trim-thp-guard-v2.patch` (0004, allocator trim +
-  huge-pages guard — v2 reworked + verified; v1 superseded, it had an
-  INC_SYS wipe bug that would break the Linux build)
+Phase 1 is complete once 0004 builds green. Next is Phase 2
+(startup + size: Fix 4 lazy loading, Fix 5 packaging trim).
 
 Superseded and NOT included: `phase2-proposal1-undomemory-256.patch` (the
 one-line default flip — not a hard cap, can leave zero usable undo steps).
