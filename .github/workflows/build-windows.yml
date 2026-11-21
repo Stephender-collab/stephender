@@ -109,7 +109,15 @@ jobs:
         run: |
           try {
             $exe = "..\build_windows_x64_vc17_Release\bin\blender.exe"
-            $p = Start-Process -FilePath $exe -ArgumentList '--background','--factory-startup','--python-expr','import time; time.sleep(12)' -PassThru -NoNewWindow
+            # Write the sleep script to a file and run it with --python:
+            # passing code via --python-expr breaks under PowerShell 5.1
+            # (it joins the array unquoted, so Blender got only `import`
+            # and quit in ~0.3s, reporting 0 MB). No spaces or
+            # semicolons in any argument now, so no quoting can break.
+            # (No here-string: its terminator must start at column 0,
+            # which the YAML block cannot guarantee.)
+            Set-Content -Path ..\bench\win_startup_sleep.py -Value "import time`ntime.sleep(12)`n" -Encoding ascii
+            $p = Start-Process -FilePath $exe -ArgumentList '--background','--factory-startup','--python','..\bench\win_startup_sleep.py' -PassThru -NoNewWindow
             $peakSampled = 0
             $mods = @()
             for ($i = 0; $i -lt 13; $i++) {
@@ -125,10 +133,14 @@ jobs:
             $peakOs = 0
             try { $peakOs = $p.PeakWorkingSet64 } catch { }
             if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
-            Write-Output "STEPHENDER-WIN-STARTUP-WS-SAMPLED-MB=$([math]::Round($peakSampled/1MB,1))"
-            Write-Output "STEPHENDER-WIN-STARTUP-WS-PEAK-MB=$([math]::Round($peakOs/1MB,1))"
-            foreach ($dll in @('OpenImageDenoise.dll','oslcomp.dll','oslexec.dll','oslquery.dll','embree4.dll','usd_ms.dll','openvdb.dll')) {
-              Write-Output "STEPHENDER-WIN-MODULE $dll loaded=$($mods -contains $dll)"
+            if ($peakSampled -eq 0) {
+              Write-Output "STEPHENDER-WIN-STARTUP-MEASURE-FAILED: blender exited before any sample was taken"
+            } else {
+              Write-Output "STEPHENDER-WIN-STARTUP-WS-SAMPLED-MB=$([math]::Round($peakSampled/1MB,1))"
+              Write-Output "STEPHENDER-WIN-STARTUP-WS-PEAK-MB=$([math]::Round($peakOs/1MB,1))"
+              foreach ($dll in @('OpenImageDenoise.dll','oslcomp.dll','oslexec.dll','oslquery.dll','embree4.dll','usd_ms.dll','openvdb.dll')) {
+                Write-Output "STEPHENDER-WIN-MODULE $dll loaded=$($mods -contains $dll)"
+              }
             }
           } catch {
             Write-Output "STEPHENDER-WIN-STARTUP-MEASURE-FAILED: $($_.Exception.Message)"
