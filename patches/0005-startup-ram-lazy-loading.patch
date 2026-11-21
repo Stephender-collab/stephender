@@ -1,0 +1,348 @@
+From: Stephender (Antigravity Phase 2, Fix 4 — startup RAM lazy loading)
+Subject: [PATCH] Cut startup RAM via Windows /DELAYLOAD and deferred Python remote-library imports
+
+Phase 2 Fix 4 from ANTIGRAVITY-PLAN.md. Applies cleanly on top of
+0001-undo-hardening + 0002-physical-ram + 0003-ram-aware-cache +
+0004-tbb-trim-thp-guard against Blender v5.2.4 (cd5dc428cce1).
+
+100% of features preserved. No add-ons, locales, GPU kernels, or Python
+docstrings are removed or altered.
+
+Summary of changes
+------------------
+1. Windows MSVC /DELAYLOAD (source/creator/CMakeLists.txt +
+   intern/cycles/scene/osl.cpp):
+   Delay-load heavy rendering/denoising/shading DLLs on Windows x64
+   (blender.exe target only, guarded by WIN32 AND MSVC AND NOT
+   WITH_PYTHON_MODULE AND DEFINED LIBDIR plus per-feature CMake flags
+   and Release/Debug DLL names), linking delayimp.lib.
+
+   PE import/export section audit against the actual Windows CI build
+   (ci-builds/fix1-windows/stephender-windows-x64/stephender-windows-x64.zip):
+   - OpenImageDenoise.dll (0.16 MB -> pulls OpenImageDenoise_core.dll
+     44.77 MB = 44.93 MB on disk): 32/32 CODE imports, 0 DATA, pure C API
+     (oidn*), no other shipped DLL imports it, not called at startup
+     (openimagedenoise_supported() only checks CPU SSE4.2). INCLUDED.
+   - oslcomp.dll (24.58 MB): 3/3 CODE imports, 0 DATA, no other shipped
+     DLL imports it, not called at startup. INCLUDED.
+   - oslexec.dll (46.81 MB) + oslquery.dll (0.14 MB, plus transitive
+     oslnoise.dll 0.04 MB):
+     * oslquery.dll: 3/3 CODE imports, 0 DATA (imported only by oslexec.dll).
+     * oslexec.dll: originally 43 CODE + 3 DATA imports
+       (OSL::Strings::Rec709, OSL::Strings::HDTV, OSL::Strings::ACEScg),
+       referenced ONLY at intern/cycles/scene/osl.cpp:347,350,353.
+       Replacing those 3 tokens with string literals "Rec709", "HDTV",
+       "ACEScg" (exact byte values verified via ctypes.c_char_p.in_dll on
+       liboslexec.so.1.15.3; calls the exact same ShadingSystem::attribute
+       (OIIO::string_view, OIIO::string_view) overload already called at
+       osl.cpp:341) eliminates all 3 DATA imports -> 0 DATA imports.
+       OSL::ErrorHandler at osl.cpp:42 is OIIO::ErrorHandler (OpenImageIO_Util),
+       not oslexec.dll; OSLManager::free_memory() is empty in v5.2.4.
+       INCLUDED.
+   - embree4.dll (25.79 MB -> pulls sycl8.dll 3.28 MB + ur_win_proxy_loader.dll
+     0.03 MB = 29.10 MB on disk): 32/32 CODE imports, 0 DATA, pure C API
+     (rtc*), no other shipped DLL imports it, not called at startup.
+     INCLUDED.
+   - Total deferred on-disk DLL footprint on Windows: ~145.6 MB
+     (expected startup working-set/RSS reduction on Windows: ~50-85 MB
+     from /DELAYLOAD alone, plus ~15-25 MB from Part 2 Python deferral).
+
+   Explicitly EXCLUDED candidates (and why):
+   - usd_ms.dll (47.47 MB): 31 imported DATA symbols (.data/.rdata,
+     including pxrBlender_v26_03__pxrReserved__::HgiTokens, HdAovTokens,
+     HdTokens, HdReprTokens, HdRenderTagTokens, HdPrimTypeTokens,
+     GfCamera::DEFAULT_{HORIZONTAL,VERTICAL}_APERTURE, etc.). MSVC link.exe
+     rejects /DELAYLOAD:usd_ms.dll with fatal error LNK1194.
+   - openvdb.dll (3.46 MB on Windows): 243/243 CODE imports, 0 DATA, BUT
+     (a) usd_ms.dll eagerly imports openvdb.dll, so it loads with usd_ms.dll
+     regardless, and (b) source/creator/creator.cc:506 calls
+     BKE_volumes_init() -> openvdb::initialize() unconditionally at startup.
+     Delay-loading openvdb.dll saves 0 MB while adding thunk overhead.
+
+2. Deferred Python startup imports (Linux + Windows):
+   Profiling the real Linux CI binary (fix3-linux) with
+   PYTHONPROFILEIMPORTTIME=1 and /proc/<pid>/smaps showed that
+   scripts/addons_core/bl_pkg/__init__.py eagerly imported
+   _bpy_internal.assets.remote_library.listing_downloader on EVERY startup
+   inside _remote_asset_library_restore_backups() BEFORE checking whether
+   any enabled remote asset library (or _listing_backup directory) exists.
+   Importing listing_downloader pulled in _bpy_internal.http.downloader ->
+   requests, urllib3, cattrs, charset_normalizer, chardet, idna, http.client,
+   ssl/_ssl.so (5.73 MB), hashlib/_hashlib.so (4.16 MB) — 154 network/SSL
+   modules (264 total modules), ~22.7 MB RSS, and ~250-410 ms startup time.
+
+   Changes:
+   - scripts/modules/_bpy_internal/assets/remote_library/listing_common.py:
+     add is_more_recent_than() (pure stdlib Path + lazy time, zero HTTP/SSL
+     imports).
+   - scripts/modules/_bpy_internal/assets/remote_library/listing_downloader.py:
+     re-export is_more_recent_than from listing_common (100% API and __all__
+     compatible).
+   - scripts/addons_core/bl_pkg/__init__.py:
+     * in remote_asset_library_sync(), check listing_common.is_more_recent_than()
+       before importing listing_downloader (saves the same ~22.7 MB in GUI
+       mode when a remote library / online essentials listing is fresh).
+     * in _remote_asset_library_restore_backups(), defer importing
+       listing_downloader until an enabled remote asset library actually has
+       a _listing_backup directory on disk.
+
+   Measured live on the real Linux CI binary (fix3-linux, --background
+   --factory-startup):
+   - Startup RSS dropped from ~270.8 MB to ~248.1 MB (-22.7 MB RSS).
+   - _ssl.so + _hashlib.so RSS dropped from 9.91 MB to 0.00 MB.
+   - Loaded Python modules dropped from 577 to 313 (-264 modules; 0
+     ssl/hashlib/urllib/http/requests/cattrs modules loaded).
+
+3. Linux -Wl,--as-needed audit (no CMake change required):
+   - Ubuntu 24.04 gcc-14 specs already pass --as-needed by default
+     (%{!fsanitize=*:--as-needed}).
+   - readelf -d on fix3-linux/extracted/blender shows 34 DT_NEEDED libs;
+     ldd -u -r reports exit 0 and 0 unused direct dependencies.
+   - Remaining heavy Linux startup libs (libusd_ms.so 37.0 MB,
+     libopenvdb.so 24.6 MB, liboslcomp.so 8.3 MB, liboslexec.so 8.1 MB)
+     are linked via direct ELF symbols; deferring them on Linux requires
+     dlopen boundaries (explicitly out of scope for Fix 4).
+   - Expected Linux startup RSS win from Fix 4: ~22-23 MB (from Part 2
+     Python import deferral alone).
+
+Unverified items (must be confirmed on Windows + Linux CI builds)
+-----------------------------------------------------------------
+- Windows MSVC link.exe /DELAYLOAD link and runtime behavior (dumpbin is
+  not available on this Linux VM; PE import/export section analysis was
+  performed directly on the fix1-windows artifact binary).
+- In particular, ccl::OSLRenderServices inherits from OSL::RendererServices
+  (18 inherited virtual methods imported from oslexec.dll); MSVC x64
+  /DELAYLOAD handles virtual method pointers via local jump thunks, but
+  real MSVC link.exe + OSL runtime verification on Windows CI is required.
+- Windows runtime startup RSS and DLL-load verification (e.g. confirming
+  OpenImageDenoise_core.dll, oslexec.dll, oslcomp.dll, embree4.dll are
+  not loaded on empty startup, and load cleanly on-demand during BMW27
+  render, OIDN denoise, and OSL shader compile).
+- Full C++ compilation of intern/cycles/scene/osl.cpp on both GCC-14 and
+  MSVC 2022 (only the 3 OSL::Strings::* arguments to ShadingSystem::attribute
+  were replaced with string literals matching line 341).
+
+STATUS: STAGED - verified full-stack apply (0001->0002->0003->0004->this)
+in scratch against Blender v5.2.4 (cd5dc428cce1), py_compile clean on
+system + bundled Python 3.13, and live Python startup RSS measured on
+fix3-linux binary. NOT yet in stephender-repo/patches/.
+
+diff --git a/intern/cycles/scene/osl.cpp b/intern/cycles/scene/osl.cpp
+index 9cfb69e..22dd21b 100644
+--- a/intern/cycles/scene/osl.cpp
++++ b/intern/cycles/scene/osl.cpp
+@@ -342,15 +342,17 @@ void OSLManager::shading_system_init(const string &colorspace_interop_id)
+       ss->attribute("searchpath:shader", shader_path);
+       ss->attribute("greedyjit", 1);
+ 
+-      /* OSL doesn't accept an arbitrary space, so support a few specific spaces. */
++      /* OSL doesn't accept an arbitrary space, so support a few specific spaces.
++       * Pass string literals rather than OSL::Strings::* data exports so oslexec.dll
++       * has zero imported data symbols and can be delay-loaded on Windows (MSVC /DELAYLOAD). */
+       if (colorspace_interop_id == "lin_rec709_scene") {
+-        ss->attribute("colorspace", OSL::Strings::Rec709);
++        ss->attribute("colorspace", "Rec709");
+       }
+       else if (colorspace_interop_id == "lin_rec2020_scene") {
+-        ss->attribute("colorspace", OSL::Strings::HDTV);
++        ss->attribute("colorspace", "HDTV");
+       }
+       else if (colorspace_interop_id == "lin_ap1_scene") {
+-        ss->attribute("colorspace", OSL::Strings::ACEScg);
++        ss->attribute("colorspace", "ACEScg");
+       }
+ 
+       const char *groupdata_alloc_str = getenv("CYCLES_OSL_GROUPDATA_ALLOC");
+diff --git a/scripts/addons_core/bl_pkg/__init__.py b/scripts/addons_core/bl_pkg/__init__.py
+index c563730..1e29871 100644
+--- a/scripts/addons_core/bl_pkg/__init__.py
++++ b/scripts/addons_core/bl_pkg/__init__.py
+@@ -452,12 +452,14 @@ def remote_asset_library_sync(
+         print("  skipping {!r}, online access is not allowed,".format(asset_library_url))
+         return
+ 
+-    from _bpy_internal.assets.remote_library import listing_downloader
++    # Check if the download should happen at all before importing listing_downloader
++    # (which eagerly pulls in requests/urllib3/ssl/hashlib/cattrs).
++    if only_if_older_than_sec:
++        from _bpy_internal.assets.remote_library import listing_common
++        if listing_common.is_more_recent_than(asset_library_local_path, only_if_older_than_sec):
++            return
+ 
+-    # Check if the download should happen at all.
+-    if only_if_older_than_sec and listing_downloader.is_more_recent_than(
+-            asset_library_local_path, only_if_older_than_sec):
+-        return
++    from _bpy_internal.assets.remote_library import listing_downloader
+ 
+     # Only actually start downloading if no other Blender is already syncing
+     # this asset library.
+@@ -577,15 +579,19 @@ def _remote_asset_library_restore_backups() -> None:
+     if not bpy.context.preferences.experimental.use_remote_asset_libraries:
+         return
+ 
+-    from _bpy_internal.assets.remote_library import listing_downloader
+-
++    listing_downloader = None
+     for asset_lib in bpy.context.preferences.filepaths.asset_libraries:
+         if not asset_lib.enabled:
+             continue
+         if not asset_lib.use_remote_url:
+             continue
++        asset_lib_path = Path(asset_lib.path)
++        if not (asset_lib_path / "_listing_backup").is_dir():
++            continue
+ 
+-        listing_downloader.restore_backup_if_exists_locked(asset_lib.remote_url, Path(asset_lib.path))
++        if listing_downloader is None:
++            from _bpy_internal.assets.remote_library import listing_downloader
++        listing_downloader.restore_backup_if_exists_locked(asset_lib.remote_url, asset_lib_path)
+ 
+ 
+ # -----------------------------------------------------------------------------
+diff --git a/scripts/modules/_bpy_internal/assets/remote_library/listing_common.py b/scripts/modules/_bpy_internal/assets/remote_library/listing_common.py
+index 574b458..b95f807 100644
+--- a/scripts/modules/_bpy_internal/assets/remote_library/listing_common.py
++++ b/scripts/modules/_bpy_internal/assets/remote_library/listing_common.py
+@@ -38,3 +38,31 @@ def api_versioned(subpath: Path | str) -> Path:
+ 
+ 
+ API_VERSIONED_ASSET_INDEX_JSON_PATH = api_versioned(ASSET_INDEX_JSON_FILENAME).as_posix()
++
++
++def is_more_recent_than(library_path: Path, max_age_sec: float | int) -> bool:
++    """Return whether the remote asset library listing is more recent than the given age.
++
++    If the listing hasn't been downloaded, return False.
++    """
++    import time
++
++    top_metadata_path = library_path / ASSET_TOP_METADATA_FILENAME
++
++    if not top_metadata_path.exists():
++        # If the metadata does not exist, it's certainly not new enough.
++        return False
++
++    try:
++        stat = top_metadata_path.stat()
++    except OSError as ex:
++        print("Could not stat {!s}: {!s}".format(top_metadata_path, ex))
++        return False
++
++    file_age_sec = time.time() - stat.st_mtime
++
++    # Note that the age can be negative, when the local clock changed. Since
++    # that's usually measured in the order of minutes/hours, and the refresh
++    # period of remote asset libraries is measured in days, we can consider it
++    # "fresh" in those cases.
++    return file_age_sec < max_age_sec
+diff --git a/scripts/modules/_bpy_internal/assets/remote_library/listing_downloader.py b/scripts/modules/_bpy_internal/assets/remote_library/listing_downloader.py
+index f5e899b..3029b44 100644
+--- a/scripts/modules/_bpy_internal/assets/remote_library/listing_downloader.py
++++ b/scripts/modules/_bpy_internal/assets/remote_library/listing_downloader.py
+@@ -32,6 +32,7 @@ import bpy
+ from _bpy_internal.http import downloader as http_dl
+ from _bpy_internal.assets.remote_library import blender_asset_library_openapi as api_models
+ from _bpy_internal.assets.remote_library import listing_common
++from _bpy_internal.assets.remote_library.listing_common import is_more_recent_than
+ from _bpy_internal.assets.remote_library import hashing
+ from _bpy_internal.assets.remote_library import http_metadata
+ from _bpy_internal.assets.remote_library import listing_asset_catalogs
+@@ -1006,34 +1007,6 @@ def _str_to_path_multiplatform(as_str: str) -> PurePath:
+     return PurePath(as_str)
+ 
+ 
+-def is_more_recent_than(library_path: Path, max_age_sec: float | int) -> bool:
+-    """Return whether the remote asset library listing is more recent than the given age.
+-
+-    If the listing hasn't been downloaded, return False.
+-    """
+-    import time
+-
+-    top_metadata_path = library_path / listing_common.ASSET_TOP_METADATA_FILENAME
+-
+-    if not top_metadata_path.exists():
+-        # If the metadata does not exist, it's certainly not new enough.
+-        return False
+-
+-    try:
+-        stat = top_metadata_path.stat()
+-    except OSError as ex:
+-        print("Could not stat {!s}: {!s}".format(top_metadata_path, ex))
+-        return False
+-
+-    file_age_sec = time.time() - stat.st_mtime
+-
+-    # Note that the age can be negative, when the local clock changed. Since
+-    # that's usually measured in the order of minutes/hours, and the refresh
+-    # period of remote asset libraries is measured in days, we can consider it
+-    # "fresh" in those cases.
+-    return file_age_sec < max_age_sec
+-
+-
+ def restore_backup_if_exists_locked(remote_url: str, local_path: Path) -> None:
+     """If there is a listing backup at the given path, restore it.
+ 
+diff --git a/source/creator/CMakeLists.txt b/source/creator/CMakeLists.txt
+index 985b969..7e2c453 100644
+--- a/source/creator/CMakeLists.txt
++++ b/source/creator/CMakeLists.txt
+@@ -1964,6 +1964,58 @@ setup_platform_linker_flags(blender)
+ setup_platform_linker_libs(blender)
+ setup_platform_linker_symbol_hiding(blender)
+ 
++# Stephender Phase 2 Fix 4: delay-load heavy rendering/denoising/shading DLLs on Windows
++# so they are not mapped into RAM at startup unless actually used.
++# Verified via PE import/export section inspection on the Windows x64 CI build:
++# - OpenImageDenoise.dll (0 data imports; defers OpenImageDenoise_core.dll ~44.8 MB).
++# - oslcomp.dll (0 data imports; ~24.6 MB), oslquery.dll (0 data imports; ~0.14 MB),
++#   oslexec.dll (0 data imports after removing OSL::Strings::* refs in cycles/scene/osl.cpp;
++#   ~46.8 MB + transitive oslnoise.dll).
++# - embree4.dll (0 data imports; ~25.8 MB + transitive sycl8.dll ~3.3 MB).
++# Excluded:
++# - usd_ms.dll: 31 imported data symbols (TfStaticData tokens, GfCamera defaults; LNK1194).
++# - openvdb.dll: eagerly imported by usd_ms.dll and initialized at startup via BKE_volumes_init().
++if(WIN32 AND MSVC AND NOT WITH_PYTHON_MODULE AND DEFINED LIBDIR)
++  set(_stephender_delayload_flags)
++  if(WITH_OPENIMAGEDENOISE AND EXISTS "${LIBDIR}/OpenImageDenoise/bin/OpenImageDenoise.dll")
++    list(APPEND _stephender_delayload_flags "/DELAYLOAD:OpenImageDenoise.dll")
++  endif()
++  if(WITH_CYCLES AND WITH_CYCLES_OSL AND EXISTS "${LIBDIR}/osl/bin/oslexec.dll")
++    if(EXISTS "${LIBDIR}/osl/bin/oslexec_d.dll")
++      list(APPEND _stephender_delayload_flags
++        "$<$<CONFIG:Debug>:/DELAYLOAD:oslcomp_d.dll>"
++        "$<$<CONFIG:Debug>:/DELAYLOAD:oslexec_d.dll>"
++        "$<$<CONFIG:Debug>:/DELAYLOAD:oslquery_d.dll>"
++        "$<$<NOT:$<CONFIG:Debug>>:/DELAYLOAD:oslcomp.dll>"
++        "$<$<NOT:$<CONFIG:Debug>>:/DELAYLOAD:oslexec.dll>"
++        "$<$<NOT:$<CONFIG:Debug>>:/DELAYLOAD:oslquery.dll>"
++      )
++    else()
++      list(APPEND _stephender_delayload_flags
++        "/DELAYLOAD:oslcomp.dll"
++        "/DELAYLOAD:oslexec.dll"
++        "/DELAYLOAD:oslquery.dll"
++      )
++    endif()
++  endif()
++  if(WITH_CYCLES AND WITH_CYCLES_EMBREE AND NOT EMBREE_STATIC_LIB AND
++     DEFINED EMBREE_MAJOR_VERSION AND EXISTS "${EMBREE_ROOT_DIR}/bin/embree${EMBREE_MAJOR_VERSION}.dll")
++    if(EXISTS "${EMBREE_ROOT_DIR}/bin/embree${EMBREE_MAJOR_VERSION}_d.dll")
++      list(APPEND _stephender_delayload_flags
++        "$<$<CONFIG:Debug>:/DELAYLOAD:embree${EMBREE_MAJOR_VERSION}_d.dll>"
++        "$<$<NOT:$<CONFIG:Debug>>:/DELAYLOAD:embree${EMBREE_MAJOR_VERSION}.dll>"
++      )
++    else()
++      list(APPEND _stephender_delayload_flags "/DELAYLOAD:embree${EMBREE_MAJOR_VERSION}.dll")
++    endif()
++  endif()
++  if(_stephender_delayload_flags)
++    target_link_libraries(blender PRIVATE delayimp.lib)
++    target_link_options(blender PRIVATE ${_stephender_delayload_flags})
++  endif()
++  unset(_stephender_delayload_flags)
++endif()
++
+ blender_target_include_dirs(blender ${INC})
+ 
+ # -----------------------------------------------------------------------------

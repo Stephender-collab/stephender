@@ -27,10 +27,25 @@ Currently in:
 - `0004-tbb-trim-thp-guard.patch` (Phase 1 Fix 3 v2, allocator trim
   after undo purge / file load / render + huge-pages guard on
   >8 GB machines only; v2 reworked + verified, full stack
-  0001→0002→0003→0004 applies clean in scratch)
+  0001→0002→0003→0004 applies clean in scratch; both builds green —
+  Linux 44886084975, Windows 44886085141; post-render RSS measured
+  494.9 MB → 354.3 MB, output byte-identical)
+- `0005-startup-ram-lazy-loading.patch` (Phase 2 Fix 4, startup RAM:
+  Windows /DELAYLOAD for OpenImageDenoise, oslcomp, oslexec, oslquery,
+  embree4 — PE audit on the real Windows binary confirms 0 data
+  imports for all five (oslexec's only 3 data imports were the
+  OSL::Strings::* tokens, replaced with literals in osl.cpp);
+  usd_ms excluded — 31 data imports, LNK1194; openvdb excluded —
+  eager at startup, 0 MB saved; deferred Python remote-library
+  imports in bl_pkg — Linux startup RSS measured 270.2 → 247.7 MB,
+  modules 577 → 313, zero ssl/requests modules; Linux --as-needed
+  already default, no change. Muse verified the whole patch
+  independently before landing: stack, PE audit, live RSS, function
+  tests. Unverified until CI: MSVC link, Windows runtime RSS, full
+  C++ compile of osl.cpp.)
 
-Phase 1 is complete once 0004 builds green. Next is Phase 2
-(startup + size: Fix 4 lazy loading, Fix 5 packaging trim).
+Phase 1 is complete (0001–0004, all green + measured). Phase 2 is
+underway (0005 landed; Fix 5 packaging trim is next).
 
 Superseded and NOT included: `phase2-proposal1-undomemory-256.patch` (the
 one-line default flip — not a hard cap, can leave zero usable undo steps).
