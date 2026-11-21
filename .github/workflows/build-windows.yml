@@ -97,6 +97,43 @@ jobs:
           ..\build_windows_x64_vc17_Release\bin\blender.exe --version
           ..\build_windows_x64_vc17_Release\bin\blender.exe --background --factory-startup --python-expr "import bpy; print('objects:', len(bpy.data.objects)); print('undo_mem_limit:', bpy.context.preferences.edit.undo_memory_limit)"
 
+      # Stephender: measure the REAL Windows startup working set on the
+      # runner (no Windows machine exists on Muse's side). Keeps Blender
+      # alive ~12s with a sleeping python expr, samples WorkingSet64,
+      # reports the OS-tracked PeakWorkingSet64, and lists whether the
+      # /DELAYLOAD DLLs are actually loaded at startup. Measurement only
+      # — a failure here never fails the build.
+      - name: Measure Windows startup working set
+        working-directory: blender-source
+        shell: powershell
+        run: |
+          try {
+            $exe = "..\build_windows_x64_vc17_Release\bin\blender.exe"
+            $p = Start-Process -FilePath $exe -ArgumentList '--background','--factory-startup','--python-expr','import time; time.sleep(12)' -PassThru -NoNewWindow
+            $peakSampled = 0
+            $mods = @()
+            for ($i = 0; $i -lt 13; $i++) {
+              Start-Sleep -Seconds 1
+              $p.Refresh()
+              if ($p.HasExited) { break }
+              try { if ($p.WorkingSet64 -gt $peakSampled) { $peakSampled = $p.WorkingSet64 } } catch { }
+              if ($i -eq 3) {
+                try { $mods = (Get-Process -Id $p.Id -ErrorAction Stop).Modules | Select-Object -ExpandProperty ModuleName } catch { $mods = @() }
+              }
+            }
+            $p.Refresh()
+            $peakOs = 0
+            try { $peakOs = $p.PeakWorkingSet64 } catch { }
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+            Write-Output "STEPHENDER-WIN-STARTUP-WS-SAMPLED-MB=$([math]::Round($peakSampled/1MB,1))"
+            Write-Output "STEPHENDER-WIN-STARTUP-WS-PEAK-MB=$([math]::Round($peakOs/1MB,1))"
+            foreach ($dll in @('OpenImageDenoise.dll','oslcomp.dll','oslexec.dll','oslquery.dll','embree4.dll','usd_ms.dll','openvdb.dll')) {
+              Write-Output "STEPHENDER-WIN-MODULE $dll loaded=$($mods -contains $dll)"
+            }
+          } catch {
+            Write-Output "STEPHENDER-WIN-STARTUP-MEASURE-FAILED: $($_.Exception.Message)"
+          }
+
       - name: Regression test — Blender bl_global_undo.py
         working-directory: blender-source
         shell: powershell
