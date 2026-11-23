@@ -7,9 +7,17 @@ name: Build Stephender (Linux)
 on:
   push:
     branches: [main]
+    paths:
+      - 'patches/**'
+      - 'bench/**'
+      - '.github/workflows/**'
   workflow_dispatch:
   release:
     types: [published]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'release' && 'release' || 'branch' }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'release' }}
 
 jobs:
   build-linux:
@@ -36,16 +44,40 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ccache ninja-build subversion gcc-14 g++-14
 
+      - name: Compute rolling cache week
+        id: cache-week
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
       - name: Restore ccache
         uses: actions/cache@v4
         with:
           path: .ccache
-          key: ccache-linux-${{ hashFiles('patches/*.patch') }}
+          key: ccache-linux-${{ steps.cache-week.outputs.week }}-${{ hashFiles('patches/*.patch') }}
           restore-keys: |
-            ccache-linux-
+            ccache-linux-${{ steps.cache-week.outputs.week }}-
 
       - name: Clone Blender v5.2.4 (shallow)
-        run: git clone --depth 1 --branch v5.2.4 https://projects.blender.org/blender/blender.git blender-source
+        run: |
+          PRIMARY_URL="https://projects.blender.org/blender/blender.git"
+          MIRROR_URL="https://github.com/blender/blender.git"
+          cloned=0
+          for attempt in 1 2 3; do
+            echo "Cloning Blender v5.2.4 from $PRIMARY_URL (attempt $attempt/3)..."
+            rm -rf blender-source
+            if git clone --depth 1 --branch v5.2.4 "$PRIMARY_URL" blender-source; then
+              cloned=1
+              break
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "Clone attempt $attempt failed; retrying in 15s..."
+              sleep 15
+            fi
+          done
+          if [ "$cloned" -ne 1 ]; then
+            echo "Primary host failed after 3 attempts; falling back to GitHub mirror $MIRROR_URL..."
+            rm -rf blender-source
+            git clone --depth 1 --branch v5.2.4 "$MIRROR_URL" blender-source
+          fi
 
       - name: Get prebuilt libraries
         working-directory: blender-source
