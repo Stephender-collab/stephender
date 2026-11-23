@@ -1,0 +1,411 @@
+From: Stephender (Antigravity Phase 3, Fix 6 replacement — render-worker priority)
+Subject: [PATCH] Lower Cycles CPU render worker thread OS priority during renders
+
+Phase 3 Fix 6 replacement (supersedes the rejected tile-size Fix 6 from Job #12
+and the rejected 3-core cap from Job #14). Applies cleanly on top of
+0001-undo-hardening + 0002-physical-ram + 0003-ram-aware-cache +
+0004-tbb-trim-thp-guard + 0005-startup-ram-lazy-loading + 0006-packaging-trim
+against Blender v5.2.4 (cd5dc428cce1).
+
+Motivation (Job #14 measurements on 4-vCPU Linux VM, BMW27 64-sample CPU):
+- Lowering render OS priority to nice +10 cut foreground probe latency by -47.4%
+  pooled median (178.96 -> 94.20 ms), -46.8% p95 (206.54 -> 109.91 ms), and
+  -59.8% quiet worst-case (273.96 -> 110.03 ms), for +0.46% render time on a
+  clean run (+1.77% 2-run mean), with all 4 threads preserved and pixel-identical
+  807,001-byte output (0 / 518,400 differing pixels).
+
+Design summary
+--------------
+1. intern/cycles/util/thread_priority.h (new header, registered in
+   intern/cycles/util/CMakeLists.txt) + intern/cycles/util/thread.cpp:
+   - Adds `ccl::ScopedLowThreadPriority`, an RAII guard that lowers ONLY the
+     calling thread's OS scheduling priority while in scope and restores it on
+     scope exit where permitted by the OS:
+     * Windows (_WIN32): `GetThreadPriority` / `SetThreadPriority` to
+       `THREAD_PRIORITY_BELOW_NORMAL`, restored unconditionally on exit. Does
+       not use `THREAD_MODE_BACKGROUND_BEGIN` (avoids I/O & memory-page
+       throttling on 8 GB systems) or `THREAD_PRIORITY_IDLE` (avoids starvation).
+     * Linux (__linux__): per-thread `getpriority`/`setpriority(PRIO_PROCESS,
+       syscall(SYS_gettid), 10)` targeting only the calling kernel thread (LWP),
+       with `errno` preserved and best-effort restore on exit (succeeds under
+       `CAP_SYS_NICE`/`RLIMIT_NICE`; silently no-ops with `EACCES` for
+       unprivileged users while keeping the main/UI thread at nice 0).
+     * Other platforms: no-op default ctor/dtor.
+   - Strictly monotonic: never raises a thread that is already running at an
+     equal or lower priority (e.g., user-launched `nice -n 15` or Windows
+     `THREAD_PRIORITY_LOWEST`/`IDLE`).
+   - Placed in a dedicated header (`util/thread_priority.h`) included only by
+     `util/thread.cpp` and `integrator/path_trace_work_cpu.cpp` to avoid
+     invalidating ccache/sccache across the rest of Cycles.
+   - No BLI OS thread-priority helper exists in Blender v5.2.4, and Cycles util
+     is standalone (no BLI dependency).
+
+2. intern/cycles/integrator/path_trace_work_cpu.cpp:
+   - Converts the CPU compute `parallel_for` loops (`render_samples`,
+     `adaptive_sampling_converge_filter_count_active`, `cryptomatte_postproces`,
+     and `denoise_volume_guiding_buffers`) to `blocked_range` chunks and places
+     `const ScopedLowThreadPriority low_priority;` at the start of each chunk
+     (identical oneTBB grainsize=1 / auto_partitioner load balancing; ~tens of
+     chunks per batch instead of per-pixel syscalls).
+   - Covers every thread that executes Cycles CPU render work inside
+     `local_arena` (`Session::session_thread_` in slot 0 and the `N-1` oneTBB
+     pool workers in slots 1..N-1), while NEVER touching Blender's main/UI
+     thread, `WM_jobs` render job thread, GPU path tracing (`PathTraceWorkGPU`),
+     EEVEE/Workbench, depsgraph, or compositor.
+   - Intentionally leaves `PathTraceWorkCPU::copy_to_display()` at normal
+     priority so no display/GPU texture-mapping lock is held at lowered priority.
+   - Default-on with no new user preference or UI change.
+
+Verification performed on this Linux machine
+--------------------------------------------
+- Full 7-patch stack (0001..0006 + this patch) verified to apply cleanly on
+  Blender v5.2.4 (cd5dc428cce1) in a clean scratch clone.
+- `intern/cycles/util/thread.cpp` + `thread_priority.h` compiled with
+  `g++ -std=c++20 -Wall -Wextra -Werror -Wshadow -Wconversion`:
+  * Linux native build + live `/proc/<pid>/task/*/stat` test confirmed:
+    main thread nice=0, non-render thread nice=0, 3 worker threads nice=10,
+    pre-niced thread nice=15 (not raised), `errno` preserved.
+  * Mock `_WIN32` build + unit test confirmed lowering to BELOW_NORMAL,
+    symmetric restore to NORMAL, and monotonicity for LOWEST/ERROR_RETURN.
+  * Non-Linux/non-Windows `#else` branch compiled cleanly with zero warnings.
+- NOT YET VERIFIED (requires CI + Windows desktop): full Blender Linux/Windows
+  CMake build and link, `path_trace_work_cpu.cpp` compilation against full
+  Cycles headers, post-CI Linux live Cycles render `/proc` & BMW27 timing/PNG
+  re-check, and real Windows desktop interactive responsiveness + bare-metal
+  render-time check.
+
+STATUS: STAGED - NOT yet in stephender-repo/patches/.
+
+diff --git a/intern/cycles/integrator/path_trace_work_cpu.cpp b/intern/cycles/integrator/path_trace_work_cpu.cpp
+index 4678d91d..67fecc66 100644
+--- a/intern/cycles/integrator/path_trace_work_cpu.cpp
++++ b/intern/cycles/integrator/path_trace_work_cpu.cpp
+@@ -20,6 +20,7 @@
+ #include "session/buffers.h"
+ 
+ #include "util/tbb.h"
++#include "util/thread_priority.h"
+ #include "util/time.h"
+ 
+ CCL_NAMESPACE_BEGIN
+@@ -83,29 +84,35 @@ void PathTraceWorkCPU::render_samples(RenderStatistics &statistics,
+ 
+   tbb::task_arena local_arena = local_tbb_arena_create(device_);
+   local_arena.execute([&]() {
+-    parallel_for(int64_t(0), total_pixels_num, [&](int64_t work_index) {
+-      if (is_cancel_requested()) {
+-        return;
+-      }
+-
+-      const int y = work_index / image_width;
+-      const int x = work_index - y * image_width;
+-
+-      KernelWorkTile work_tile;
+-      work_tile.x = effective_buffer_params_.full_x + x;
+-      work_tile.y = effective_buffer_params_.full_y + y;
+-      work_tile.w = 1;
+-      work_tile.h = 1;
+-      work_tile.start_sample = start_sample;
+-      work_tile.sample_offset = sample_offset;
+-      work_tile.num_samples = 1;
+-      work_tile.offset = effective_buffer_params_.offset;
+-      work_tile.stride = effective_buffer_params_.stride;
+-
+-      ThreadKernelGlobalsCPU *kernel_globals = kernel_thread_globals_get(*kernel_thread_globals_);
+-
+-      render_samples_full_pipeline(kernel_globals, work_tile, samples_num);
+-    });
++    parallel_for(
++        blocked_range<int64_t>(0, total_pixels_num), [&](const blocked_range<int64_t> &r) {
++          const ScopedLowThreadPriority low_priority;
++
++          for (int64_t work_index = r.begin(); work_index < r.end(); ++work_index) {
++            if (is_cancel_requested()) {
++              return;
++            }
++
++            const int y = work_index / image_width;
++            const int x = work_index - y * image_width;
++
++            KernelWorkTile work_tile;
++            work_tile.x = effective_buffer_params_.full_x + x;
++            work_tile.y = effective_buffer_params_.full_y + y;
++            work_tile.w = 1;
++            work_tile.h = 1;
++            work_tile.start_sample = start_sample;
++            work_tile.sample_offset = sample_offset;
++            work_tile.num_samples = 1;
++            work_tile.offset = effective_buffer_params_.offset;
++            work_tile.stride = effective_buffer_params_.stride;
++
++            ThreadKernelGlobalsCPU *kernel_globals = kernel_thread_globals_get(
++                *kernel_thread_globals_);
++
++            render_samples_full_pipeline(kernel_globals, work_tile, samples_num);
++          }
++        });
+   });
+   if (device_->profiler.active()) {
+     for (ThreadKernelGlobalsCPU &kernel_globals : *kernel_thread_globals_) {
+@@ -267,35 +274,41 @@ int PathTraceWorkCPU::adaptive_sampling_converge_filter_count_active(const float
+ 
+   /* Check convergency and do x-filter in a single `parallel_for`, to reduce threading overhead. */
+   local_arena.execute([&]() {
+-    parallel_for(full_y, full_y + height, [&](int y) {
++    parallel_for(blocked_range<int>(full_y, full_y + height), [&](const blocked_range<int> &r) {
++      const ScopedLowThreadPriority low_priority;
+       ThreadKernelGlobalsCPU *kernel_globals = kernel_thread_globals_->data();
+ 
+-      bool row_converged = true;
+-      uint num_row_pixels_active = 0;
+-      for (int x = 0; x < width; ++x) {
+-        if (!kernels_.adaptive_sampling_convergence_check(
+-                kernel_globals, render_buffer, full_x + x, y, threshold, reset, offset, stride))
+-        {
+-          ++num_row_pixels_active;
+-          row_converged = false;
++      for (int y = r.begin(); y < r.end(); ++y) {
++        bool row_converged = true;
++        uint num_row_pixels_active = 0;
++        for (int x = 0; x < width; ++x) {
++          if (!kernels_.adaptive_sampling_convergence_check(
++                  kernel_globals, render_buffer, full_x + x, y, threshold, reset, offset, stride))
++          {
++            ++num_row_pixels_active;
++            row_converged = false;
++          }
+         }
+-      }
+ 
+-      atomic_fetch_and_add_uint32(&num_active_pixels, num_row_pixels_active);
++        atomic_fetch_and_add_uint32(&num_active_pixels, num_row_pixels_active);
+ 
+-      if (!row_converged) {
+-        kernels_.adaptive_sampling_filter_x(
+-            kernel_globals, render_buffer, y, full_x, width, offset, stride);
++        if (!row_converged) {
++          kernels_.adaptive_sampling_filter_x(
++              kernel_globals, render_buffer, y, full_x, width, offset, stride);
++        }
+       }
+     });
+   });
+ 
+   if (num_active_pixels) {
+     local_arena.execute([&]() {
+-      parallel_for(full_x, full_x + width, [&](int x) {
++      parallel_for(blocked_range<int>(full_x, full_x + width), [&](const blocked_range<int> &r) {
++        const ScopedLowThreadPriority low_priority;
+         ThreadKernelGlobalsCPU *kernel_globals = kernel_thread_globals_->data();
+-        kernels_.adaptive_sampling_filter_y(
+-            kernel_globals, render_buffer, x, full_y, height, offset, stride);
++        for (int x = r.begin(); x < r.end(); ++x) {
++          kernels_.adaptive_sampling_filter_y(
++              kernel_globals, render_buffer, x, full_y, height, offset, stride);
++        }
+       });
+     });
+   }
+@@ -314,12 +327,16 @@ void PathTraceWorkCPU::cryptomatte_postproces()
+ 
+   /* Check convergency and do x-filter in a single `parallel_for`, to reduce threading overhead. */
+   local_arena.execute([&]() {
+-    parallel_for(0, height, [&](int y) {
++    parallel_for(blocked_range<int>(0, height), [&](const blocked_range<int> &r) {
++      const ScopedLowThreadPriority low_priority;
+       ThreadKernelGlobalsCPU *kernel_globals = kernel_thread_globals_->data();
+-      int pixel_index = y * width;
+ 
+-      for (int x = 0; x < width; ++x, ++pixel_index) {
+-        kernels_.cryptomatte_postprocess(kernel_globals, render_buffer, pixel_index);
++      for (int y = r.begin(); y < r.end(); ++y) {
++        int pixel_index = y * width;
++
++        for (int x = 0; x < width; ++x, ++pixel_index) {
++          kernels_.cryptomatte_postprocess(kernel_globals, render_buffer, pixel_index);
++        }
+       }
+     });
+   });
+@@ -343,6 +360,7 @@ void PathTraceWorkCPU::denoise_volume_guiding_buffers()
+   /* Filter in x direction. */
+   local_arena.execute([&]() {
+     parallel_for(range, [&](const blocked_range2d<int> r) {
++      const ScopedLowThreadPriority low_priority;
+       ThreadKernelGlobalsCPU *kernel_globals = kernel_thread_globals_->data();
+       for (int y = r.cols().begin(); y < r.cols().end(); ++y) {
+         for (int x = r.rows().begin(); x < r.rows().end(); ++x) {
+@@ -356,10 +374,13 @@ void PathTraceWorkCPU::denoise_volume_guiding_buffers()
+   /* Filter in y direction. Unlike `filter_x`, the inner loop of `filter_y` is serially run inside
+    * the kernel, to avoid the need of intermediate buffers. */
+   local_arena.execute([&]() {
+-    parallel_for(min_x, max_x, [&](int x) {
++    parallel_for(blocked_range<int>(min_x, max_x), [&](const blocked_range<int> &r) {
++      const ScopedLowThreadPriority low_priority;
+       ThreadKernelGlobalsCPU *kernel_globals = kernel_thread_globals_->data();
+-      kernels_.volume_guiding_filter_y(
+-          kernel_globals, render_buffer, x, min_y, max_y, offset, stride);
++      for (int x = r.begin(); x < r.end(); ++x) {
++        kernels_.volume_guiding_filter_y(
++            kernel_globals, render_buffer, x, min_y, max_y, offset, stride);
++      }
+     });
+   });
+ }
+diff --git a/intern/cycles/util/CMakeLists.txt b/intern/cycles/util/CMakeLists.txt
+index 32d7802a..ed9d3cdb 100644
+--- a/intern/cycles/util/CMakeLists.txt
++++ b/intern/cycles/util/CMakeLists.txt
+@@ -120,6 +120,7 @@ set(SRC_HEADERS
+   task.h
+   tbb.h
+   thread.h
++  thread_priority.h
+   time.h
+   transform.h
+   types.h
+diff --git a/intern/cycles/util/thread.cpp b/intern/cycles/util/thread.cpp
+index e01c4029..5330ab5e 100644
+--- a/intern/cycles/util/thread.cpp
++++ b/intern/cycles/util/thread.cpp
+@@ -3,6 +3,7 @@
+  * SPDX-License-Identifier: Apache-2.0 */
+ 
+ #include "util/thread.h"
++#include "util/thread_priority.h"
+ 
+ #if defined(__APPLE__) || defined(__linux__) && !defined(__GLIBC__)
+ #else
+@@ -14,6 +15,13 @@
+ #  include <system_error>
+ #endif
+ 
++#ifdef __linux__
++#  include <cerrno>
++#  include <sys/resource.h>
++#  include <sys/syscall.h>
++#  include <unistd.h>
++#endif
++
+ CCL_NAMESPACE_BEGIN
+ 
+ thread::thread(std::function<void()> run_cb) : run_cb_(run_cb), joined_(false)
+@@ -61,4 +69,73 @@ bool thread::join()
+ #endif
+ }
+ 
++#if defined(_WIN32)
++
++ScopedLowThreadPriority::ScopedLowThreadPriority()
++{
++  const HANDLE current_thread = GetCurrentThread();
++  const int prev = GetThreadPriority(current_thread);
++  if (prev != THREAD_PRIORITY_ERROR_RETURN && prev > THREAD_PRIORITY_BELOW_NORMAL) {
++    if (SetThreadPriority(current_thread, THREAD_PRIORITY_BELOW_NORMAL) != 0) {
++      prev_priority_ = prev;
++      restore_needed_ = true;
++    }
++  }
++}
++
++ScopedLowThreadPriority::~ScopedLowThreadPriority()
++{
++  if (restore_needed_) {
++    SetThreadPriority(GetCurrentThread(), prev_priority_);
++  }
++}
++
++#elif defined(__linux__)
++
++namespace {
++constexpr int kLowPriorityNice = 10;
++}
++
++ScopedLowThreadPriority::ScopedLowThreadPriority()
++{
++  /* On Linux, PRIO_PROCESS with a kernel thread ID (from SYS_gettid) applies
++   * only to the calling thread (LWP), leaving the main/UI thread and all other
++   * threads in the process untouched. */
++  const int saved_errno = errno;
++  const long raw_tid = syscall(SYS_gettid);
++  if (raw_tid > 0) {
++    const id_t tid = static_cast<id_t>(raw_tid);
++    errno = 0;
++    const int prev = getpriority(PRIO_PROCESS, tid);
++    if (errno == 0 && prev < kLowPriorityNice) {
++      if (setpriority(PRIO_PROCESS, tid, kLowPriorityNice) == 0) {
++        prev_nice_ = prev;
++        tid_ = tid;
++        restore_needed_ = true;
++      }
++    }
++  }
++  errno = saved_errno;
++}
++
++ScopedLowThreadPriority::~ScopedLowThreadPriority()
++{
++  if (restore_needed_) {
++    const int saved_errno = errno;
++    /* Best-effort restore: succeeds if the process holds CAP_SYS_NICE or
++     * sufficient RLIMIT_NICE; silently fails with EACCES for unprivileged
++     * users, leaving only the worker threads that ran CPU rendering at
++     * kLowPriorityNice while the main/UI thread stays at normal priority. */
++    (void)setpriority(PRIO_PROCESS, tid_, prev_nice_);
++    errno = saved_errno;
++  }
++}
++
++#else
++
++ScopedLowThreadPriority::ScopedLowThreadPriority() = default;
++ScopedLowThreadPriority::~ScopedLowThreadPriority() = default;
++
++#endif
++
+ CCL_NAMESPACE_END
+diff --git a/intern/cycles/util/thread_priority.h b/intern/cycles/util/thread_priority.h
+new file mode 100644
+index 00000000..a9fe87f1
+--- /dev/null
++++ b/intern/cycles/util/thread_priority.h
+@@ -0,0 +1,39 @@
++/* SPDX-FileCopyrightText: 2026 Blender Foundation
++ *
++ * SPDX-License-Identifier: Apache-2.0 */
++
++#pragma once
++
++#ifdef __linux__
++#  include <sys/types.h>
++#endif
++
++CCL_NAMESPACE_BEGIN
++
++/* Scoped RAII helper that lowers the calling thread's OS scheduling priority
++ * while active (Windows: THREAD_PRIORITY_BELOW_NORMAL; Linux: per-thread nice +10)
++ * and restores the previous priority on scope exit where permitted by the OS.
++ *
++ * Only modifies the calling thread; never affects other threads (such as the
++ * main/UI thread). If the thread is already running at an equal or lower priority,
++ * leaves it unchanged. */
++class ScopedLowThreadPriority {
++ public:
++  ScopedLowThreadPriority();
++  ~ScopedLowThreadPriority();
++
++  ScopedLowThreadPriority(const ScopedLowThreadPriority &) = delete;
++  ScopedLowThreadPriority &operator=(const ScopedLowThreadPriority &) = delete;
++
++ private:
++#if defined(_WIN32)
++  int prev_priority_ = 0;
++  bool restore_needed_ = false;
++#elif defined(__linux__)
++  int prev_nice_ = 0;
++  id_t tid_ = 0;
++  bool restore_needed_ = false;
++#endif
++};
++
++CCL_NAMESPACE_END
